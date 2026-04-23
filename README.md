@@ -8,18 +8,12 @@ Each subdirectory is a self-contained submission for one kernel definition, foll
 
 ```
 syfi-agent-assisted/
-├── moe/
-│   ├── config.toml           # definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
-│   └── solution/cuda/moe.cu
 ├── gdn_prefill/
 │   ├── config.toml           # definition = "gdn_prefill_qk4_v8_d128_k_last"
 │   └── solution/cuda/gdn_prefill.cu
-├── gdn_decode/
-│   ├── config.toml           # definition = "gdn_decode_qk4_v8_d128_k_last"
-│   └── solution/cuda/gdn_decode.cu
-└── dsa_indexer/
-    ├── config.toml           # definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-    └── solution/cuda/dsa_topk_indexer.cu
+└── gdn_decode/
+    ├── config.toml           # definition = "gdn_decode_qk4_v8_d128_k_last"
+    └── solution/cuda/gdn_decode.cu
 ```
 
 ## Local testing
