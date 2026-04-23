@@ -1,0 +1,10 @@
+[solution]
+name = "syfi-dsa-topk-indexer-v1"
+definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+author = "syfi"
+
+[build]
+language = "python"
+entry_point = "dsa_topk_indexer.py::run"
+target_hardware = ["cuda"]
+destination_passing_style = true
