@@ -947,6 +947,15 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3(
       "r"(b0), "r"(b1));
 }
 
+// ldmatrix.x4.b16 was tried here to replace the 4 manual u32 loads per
+// thread in the hot kk loop. Result: GEMM1 regressed 6.23ms → 6.49ms
+// (+4%) despite halving the explicit load count. The compiler was
+// already coalescing the 4 consecutive u32 loads (same thread, same
+// base) into one LDS.128, so ldmatrix doesn't reduce load bandwidth;
+// it just adds address-compute overhead for the 32 per-lane row
+// pointers. Keeping the manual-load form until a bigger rewrite
+// (producer-consumer or tcgen05) changes the access pattern.
+
 template <int THREADS>
 __device__ __forceinline__ void stage_load_A_fp8_BK128(
     __nv_fp8_e4m3 (*sA)[LDA_FP8_PAD],
