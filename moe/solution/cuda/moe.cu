@@ -956,6 +956,42 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3(
 // pointers. Keeping the manual-load form until a bigger rewrite
 // (producer-consumer or tcgen05) changes the access pattern.
 
+// ======================================================================
+// mbarrier PTX helpers for warp-specialized producer/consumer pipelining.
+// Each stage has a `ready` barrier (producer → consumer) and a `consumed`
+// barrier (consumer → producer). Barriers live in shared memory and are
+// initialized once at kernel entry.
+// ======================================================================
+__device__ __forceinline__ void mbarrier_init_shared(uint64_t* bar, uint32_t count) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;" :: "r"(addr), "r"(count));
+}
+
+__device__ __forceinline__ void mbarrier_arrive_shared(uint64_t* bar) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  uint64_t state;
+  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];"
+               : "=l"(state) : "r"(addr));
+}
+
+__device__ __forceinline__ void mbarrier_wait_parity_shared(uint64_t* bar, uint32_t phase) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  asm volatile(
+    "{ .reg .pred p; waitLoop:\n"
+    "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+    "  @!p bra waitLoop; }\n"
+    :: "r"(addr), "r"(phase));
+}
+
+// Delayed arrive: this thread's arrival on `bar` is pending until its
+// outstanding cp.async group completes. Lets producers issue loads and
+// move on without a block-global cp_async_wait<0>. PTX op takes only
+// the mbar address (no .shared qualifier — mbarrier is implicitly shmem).
+__device__ __forceinline__ void cp_async_mbarrier_arrive(uint64_t* bar) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  asm volatile("cp.async.mbarrier.arrive.b64 [%0];" :: "r"(addr));
+}
+
 template <int THREADS>
 __device__ __forceinline__ void stage_load_A_fp8_BK128(
     __nv_fp8_e4m3 (*sA)[LDA_FP8_PAD],
@@ -1156,6 +1192,287 @@ __global__ void gemm_fp8_fp8_grouped_kernel(
       if (rlo < M && chi < N) C[(size_t)rlo * ldC + chi] = outer[i][j][1];
       if (rhi < M && clo < N) C[(size_t)rhi * ldC + clo] = outer[i][j][2];
       if (rhi < M && chi < N) C[(size_t)rhi * ldC + chi] = outer[i][j][3];
+    }
+  }
+}
+
+// ======================================================================
+// Warp-specialized FP8 GEMM1 — EXPERIMENTAL, CURRENTLY DISABLED.
+//
+// Design:
+// - Tile: BM=128, BN=64, BK_FP8=128 (one kblock per main-loop iter).
+// - 8 warps per block: warps 0-3 = producer (128 threads, all cp.async
+//   for A and B), warps 4-7 = consumer (128 threads, all MMA).
+// - 3-stage shmem pipeline synchronized with mbarriers.
+//   * mbar_ready[s]: producer → consumer signal; init count = 128 (every
+//     producer thread arrives per stage).
+//   * mbar_consumed[s]: consumer → producer signal; init count = 128.
+// - __launch_bounds__(256, 2) targets 2 blocks/SM (→ 25% occupancy).
+//
+// Status (2026-04-23):
+// 1. With a synchronous `cp_async_wait<0>` + explicit `mbarrier.arrive`
+//    in the producer, correctness passes (match_ratio 0.998 on wl0) but
+//    it's ~45% slower than the non-WSP kernel (9.04ms vs 6.23ms on wl8).
+//    Root cause: cp_async_wait<0> serializes each stage's loads within
+//    the producer, so there's never more than one stage in flight —
+//    defeating the whole point of warp specialization. And we've also
+//    halved the compute parallelism (4 consumer warps vs 8 all-compute).
+// 2. Switching to `cp.async.mbarrier.arrive.b64` (async attach — correct
+//    form per PTX ISA 8.x, no state-space qualifier) hangs. Either the
+//    barrier-arrival isn't firing as I expect or there's a subtle
+//    ordering bug with `cp_async_commit_group`. The PTX assembled and
+//    the block eventually deadlocks with the consumer still waiting on
+//    mbar_ready[0].
+//
+// To finish this, the right move is to switch the gmem→shmem path to
+// TMA (cp.async.bulk.tensor.2d) — the bulk form has a first-class
+// mbarrier argument, bypassing the commit_group dance entirely and is
+// the Hopper+/Blackwell idiom. Kernel left in the file so a future
+// attempt can iterate on it.
+// ======================================================================
+constexpr int BN_WSP             = 64;       // smaller N tile for WSP path
+constexpr int BK_WSP             = BK_FP8;   // 128
+constexpr int LDA_WSP_PAD        = BK_WSP + 16;
+constexpr int LDB_WSP_PAD        = BK_WSP + 16;
+constexpr int STAGES_WSP         = 3;
+constexpr int NPROD_WARPS        = 4;
+constexpr int NCONS_WARPS        = 4;
+constexpr int NWARPS_WSP         = NPROD_WARPS + NCONS_WARPS;          // 8
+constexpr int THREADS_WSP        = NWARPS_WSP * 32;                     // 256
+constexpr int NPROD_THREADS      = NPROD_WARPS * 32;                    // 128
+constexpr int NCONS_THREADS      = NCONS_WARPS * 32;                    // 128
+constexpr int NWARPS_M_CONS      = 2;
+constexpr int NWARPS_N_CONS      = 2;
+constexpr int WM_CONS            = BM / NWARPS_M_CONS;                  // 64
+constexpr int WN_CONS            = BN_WSP / NWARPS_N_CONS;              // 32
+constexpr int W_TILES_M_CONS     = WM_CONS / 16;                        // 4
+constexpr int W_TILES_N_CONS     = WN_CONS / 8;                         // 4
+constexpr size_t SA_WSP_BYTES    = (size_t)STAGES_WSP * BM     * LDA_WSP_PAD;
+constexpr size_t SB_WSP_BYTES    = (size_t)STAGES_WSP * BN_WSP * LDB_WSP_PAD;
+constexpr size_t MBAR_WSP_BYTES  = 2 * STAGES_WSP * sizeof(uint64_t);
+constexpr size_t GEMM_WSP_SMEM_BYTES =
+    SA_WSP_BYTES + SB_WSP_BYTES + MBAR_WSP_BYTES + 128;  // slack
+
+template <int THREADS>
+__device__ __forceinline__ void stage_load_A_wsp(
+    __nv_fp8_e4m3 (*sA)[LDA_WSP_PAD],
+    const __nv_fp8_e4m3* A, int m0, int k0, int M, int K, int tid)
+{
+  constexpr int ITERS = (BM * BK_WSP) / (THREADS * 16);
+  static_assert((BM * BK_WSP) % (THREADS * 16) == 0, "A load not tileable");
+  #pragma unroll
+  for (int it = 0; it < ITERS; it++) {
+    int id = tid + it * THREADS;
+    int r  = id / (BK_WSP / 16);
+    int c  = (id % (BK_WSP / 16)) * 16;
+    bool ok = (m0 + r) < M;
+    const void* gptr = &A[(size_t)(m0 + r) * K + (k0 + c)];
+    cp_async_16(&sA[r][c], gptr, ok);
+  }
+}
+
+template <int THREADS>
+__device__ __forceinline__ void stage_load_B_wsp(
+    __nv_fp8_e4m3 (*sB)[LDB_WSP_PAD],
+    const __nv_fp8_e4m3* B, int n0, int k0, int N, int K, int tid)
+{
+  constexpr int ITERS = (BN_WSP * BK_WSP) / (THREADS * 16);
+  static_assert((BN_WSP * BK_WSP) % (THREADS * 16) == 0, "B load not tileable");
+  #pragma unroll
+  for (int it = 0; it < ITERS; it++) {
+    int id = tid + it * THREADS;
+    int r  = id / (BK_WSP / 16);
+    int c  = (id % (BK_WSP / 16)) * 16;
+    bool ok = (n0 + r) < N;
+    const void* gptr = &B[(size_t)(n0 + r) * K + (k0 + c)];
+    cp_async_16(&sB[r][c], gptr, ok);
+  }
+}
+
+__global__ __launch_bounds__(THREADS_WSP, 2)
+void gemm_fp8_fp8_wsp_grouped_kernel(
+    const __nv_fp8_e4m3* __restrict__ A_base,     // [N_sel, K] fp8
+    const float*         __restrict__ A_scale,    // [N_sel, KB]
+    const __nv_fp8_e4m3* __restrict__ W_base,     // [E, N, K] fp8
+    const float*         __restrict__ S_base,     // [E, NB, KB]
+    const int32_t*       __restrict__ offs,
+    const int32_t*       __restrict__ sched_e,
+    const int32_t*       __restrict__ sched_tm,
+    int N, int K, int NB, int KB,
+    float*        __restrict__ C_base,            // [N_sel, ldC] fp32
+    int ldC)
+{
+  const int e    = sched_e[blockIdx.y];
+  const int tm   = sched_tm[blockIdx.y];
+  const int rs   = offs[e];
+  const int re   = offs[e + 1];
+  const int M    = re - rs;
+  const int m0   = tm * BM;
+  const int n0   = blockIdx.x * BN_WSP;
+  if (m0 >= M) return;
+
+  const __nv_fp8_e4m3* A       = A_base   + (size_t)rs * (size_t)K;
+  const float*         Asc     = A_scale  + (size_t)rs * (size_t)KB;
+  const __nv_fp8_e4m3* B_fp8   = W_base   + (size_t)e  * (size_t)N * (size_t)K;
+  const float*         B_scale = S_base   + (size_t)e  * (size_t)NB * (size_t)KB;
+  float*               C       = C_base   + (size_t)rs * (size_t)ldC;
+
+  const int tid          = threadIdx.x;
+  const int warp         = tid >> 5;
+  const int lane         = tid & 31;
+  const int nb           = n0 / BS;
+  const int group_id     = lane >> 2;
+  const int tid_in_group = lane & 3;
+
+  // Shared memory layout:
+  //   [0                 ..)      sA[STAGES][BM][LDA_WSP_PAD]
+  //   [SA_BYTES          ..)      sB[STAGES][BN_WSP][LDB_WSP_PAD]
+  //   [SA+SB             ..)      mbar_ready[STAGES]
+  //   [SA+SB+24          ..)      mbar_consumed[STAGES]
+  extern __shared__ __align__(16) char smem_raw[];
+  __nv_fp8_e4m3 (*sA)[BM][LDA_WSP_PAD] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BM][LDA_WSP_PAD]>(smem_raw);
+  __nv_fp8_e4m3 (*sB)[BN_WSP][LDB_WSP_PAD] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BN_WSP][LDB_WSP_PAD]>(smem_raw + SA_WSP_BYTES);
+  uint64_t* mbar_ready    =
+      reinterpret_cast<uint64_t*>(smem_raw + SA_WSP_BYTES + SB_WSP_BYTES);
+  uint64_t* mbar_consumed = mbar_ready + STAGES_WSP;
+
+  // Initialize mbarriers once, with arrive counts matching the number of
+  // arriving threads per cycle.
+  if (tid < STAGES_WSP) {
+    mbarrier_init_shared(&mbar_ready[tid],    NPROD_THREADS);
+    mbarrier_init_shared(&mbar_consumed[tid], NCONS_THREADS);
+  }
+  __syncthreads();
+
+  const bool is_producer = (warp < NPROD_WARPS);
+
+  if (is_producer) {
+    // Producer tid within the producer group (0..127).
+    int ptid = tid;  // warps 0..3 already map to 0..127
+
+    for (int kb = 0; kb < KB; kb++) {
+      int stage = kb % STAGES_WSP;
+      // On reuse, wait for consumer to finish with this stage.
+      if (kb >= STAGES_WSP) {
+        uint32_t cphase = ((kb / STAGES_WSP) - 1) & 1;
+        mbarrier_wait_parity_shared(&mbar_consumed[stage], cphase);
+      }
+
+      int k_off = kb * BK_WSP;
+      stage_load_A_wsp<NPROD_THREADS>(sA[stage], A, m0, k_off, M, K, ptid);
+      stage_load_B_wsp<NPROD_THREADS>(sB[stage], B_fp8, n0, k_off, N, K, ptid);
+      cp_async_commit();
+      // Attach mbarrier arrival to this cp.async group — producer moves
+      // on without blocking, so multiple stages can be in flight.
+      cp_async_mbarrier_arrive(&mbar_ready[stage]);
+    }
+  } else {
+    // Consumer warps 4..7 → cons_warp 0..3 → (warp_m, warp_n) ∈ 2×2.
+    const int cons_warp = warp - NPROD_WARPS;
+    const int warp_m    = cons_warp / NWARPS_N_CONS;
+    const int warp_n    = cons_warp % NWARPS_N_CONS;
+
+    float outer[W_TILES_M_CONS][W_TILES_N_CONS][4];
+    #pragma unroll
+    for (int i = 0; i < W_TILES_M_CONS; i++)
+      #pragma unroll
+      for (int j = 0; j < W_TILES_N_CONS; j++)
+        #pragma unroll
+        for (int q = 0; q < 4; q++) outer[i][j][q] = 0.0f;
+
+    for (int kb = 0; kb < KB; kb++) {
+      int stage = kb % STAGES_WSP;
+      uint32_t rphase = (kb / STAGES_WSP) & 1;
+      mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
+
+      // Per-kblock inner accumulator.
+      float inner[W_TILES_M_CONS][W_TILES_N_CONS][4];
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_CONS; i++)
+        #pragma unroll
+        for (int j = 0; j < W_TILES_N_CONS; j++)
+          #pragma unroll
+          for (int q = 0; q < 4; q++) inner[i][j][q] = 0.0f;
+
+      #pragma unroll
+      for (int kk = 0; kk < BK_WSP; kk += 32) {
+        uint32_t Aregs[W_TILES_M_CONS][4];
+        #pragma unroll
+        for (int i = 0; i < W_TILES_M_CONS; i++) {
+          int rbase = warp_m * WM_CONS + i * 16;
+          int row0  = rbase + group_id;
+          int row1  = rbase + group_id + 8;
+          int col0  = kk + tid_in_group * 4;
+          int col1  = col0 + 16;
+          Aregs[i][0] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col0]);
+          Aregs[i][1] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col0]);
+          Aregs[i][2] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col1]);
+          Aregs[i][3] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col1]);
+        }
+        uint32_t Bregs[W_TILES_N_CONS][2];
+        #pragma unroll
+        for (int j = 0; j < W_TILES_N_CONS; j++) {
+          int cbase = warp_n * WN_CONS + j * 8;
+          int col_n = cbase + group_id;
+          int rowk0 = kk + tid_in_group * 4;
+          int rowk1 = rowk0 + 16;
+          Bregs[j][0] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk0]);
+          Bregs[j][1] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk1]);
+        }
+        #pragma unroll
+        for (int i = 0; i < W_TILES_M_CONS; i++) {
+          #pragma unroll
+          for (int j = 0; j < W_TILES_N_CONS; j++) {
+            mma_m16n8k32_e4m3(
+                inner[i][j][0], inner[i][j][1], inner[i][j][2], inner[i][j][3],
+                Aregs[i][0], Aregs[i][1], Aregs[i][2], Aregs[i][3],
+                Bregs[j][0], Bregs[j][1]);
+          }
+        }
+      }
+
+      // Apply per-kblock scales and accumulate into outer.
+      float w_sc = B_scale[(size_t)nb * KB + kb];
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_CONS; i++) {
+        int rbase    = warp_m * WM_CONS + i * 16;
+        int rlo_glob = m0 + rbase + group_id;
+        int rhi_glob = rlo_glob + 8;
+        float a_lo = (rlo_glob < M) ? Asc[(size_t)rlo_glob * KB + kb] : 0.0f;
+        float a_hi = (rhi_glob < M) ? Asc[(size_t)rhi_glob * KB + kb] : 0.0f;
+        float s_lo = a_lo * w_sc;
+        float s_hi = a_hi * w_sc;
+        #pragma unroll
+        for (int j = 0; j < W_TILES_N_CONS; j++) {
+          outer[i][j][0] += inner[i][j][0] * s_lo;
+          outer[i][j][1] += inner[i][j][1] * s_lo;
+          outer[i][j][2] += inner[i][j][2] * s_hi;
+          outer[i][j][3] += inner[i][j][3] * s_hi;
+        }
+      }
+
+      // Signal this stage consumed (producer may reload it).
+      mbarrier_arrive_shared(&mbar_consumed[stage]);
+    }
+
+    // Epilogue: write outer fp32 to C.
+    #pragma unroll
+    for (int i = 0; i < W_TILES_M_CONS; i++) {
+      int rbase = m0 + warp_m * WM_CONS + i * 16;
+      int rlo   = rbase + group_id;
+      int rhi   = rlo + 8;
+      #pragma unroll
+      for (int j = 0; j < W_TILES_N_CONS; j++) {
+        int cbase = n0 + warp_n * WN_CONS + j * 8;
+        int clo   = cbase + tid_in_group * 2;
+        int chi   = clo + 1;
+        if (rlo < M && clo < N) C[(size_t)rlo * ldC + clo] = outer[i][j][0];
+        if (rlo < M && chi < N) C[(size_t)rlo * ldC + chi] = outer[i][j][1];
+        if (rhi < M && clo < N) C[(size_t)rhi * ldC + clo] = outer[i][j][2];
+        if (rhi < M && chi < N) C[(size_t)rhi * ldC + chi] = outer[i][j][3];
+      }
     }
   }
 }
@@ -1403,6 +1720,9 @@ static void run_impl(
     cudaFuncSetAttribute(gemm_fp8_fp8_grouped_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)GEMM_FP8_SMEM_BYTES);
+    cudaFuncSetAttribute(gemm_fp8_fp8_wsp_grouped_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)GEMM_WSP_SMEM_BYTES);
     gemm_shmem_attr_set = true;
   }
 
@@ -1491,6 +1811,8 @@ static void run_impl(
                     total_m_tiles * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
 
     // 8a. Grouped GEMM1 — FP8×FP8 tensor cores, per-kblock block-scale accumulation.
+    // (Warp-specialized variant `gemm_fp8_fp8_wsp_grouped_kernel` exists in
+    // this file but is currently disabled — see comment at its definition.)
     {
       dim3 grid((II + BN - 1) / BN, total_m_tiles);
       gemm_fp8_fp8_grouped_kernel<<<grid, THREADS_FP8, GEMM_FP8_SMEM_BYTES, stream>>>(
