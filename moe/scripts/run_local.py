@@ -30,7 +30,10 @@ def get_trace_set_path() -> str:
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark locally and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5, rtol=100.0, atol=1e10)
+        # Tight tolerances matching Modal defaults (rtol=atol=1e-2) so local
+        # correctness signal is meaningful.
+        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5,
+                                 rtol=1e-2, atol=1e-2)
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
