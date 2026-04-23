@@ -1,8 +1,8 @@
 /*
  * GDN prefill — bf16 tensor-core chunked kernel (WY form).
- * V_TILE=16, C=32, 4 warps/block (warp-specialized matmuls).
+ * V_TILE=16, C=16, 4 warps/block (warp-specialized matmuls).
  *
- * Within a chunk of C=32 tokens (starting state S_0, per-chunk γ_0 = 1):
+ * Within a chunk of C=16 tokens (starting state S_0, per-chunk γ_0 = 1):
  *   ŝ_t = S_t / γ_t  with γ_t = Π_{s≤t} g_s → un-gated delta-rule:
  *     ŝ_t = (I − β_t k_t k_t^T) ŝ_{t-1} + β_t k_t (v_t/γ_t)^T
  *   ⇒ ŝ_t = ŝ_0 + Σ_{s≤t} β_s k_s u_s^T
@@ -37,24 +37,12 @@ constexpr int N_V    = V_DIM / V_TILE;              // 8
 constexpr int NT     = V_TILE / 16;                 // 1
 constexpr int WARPS  = 4;
 constexpr int BLOCK_THREADS = WARPS * 32;           // 128
-constexpr int C      = 32;
-constexpr int C_TILES = C / 16;                     // 2 (16×16 tiles along C dim)
+constexpr int C      = 16;
 // Pad shmem row strides to break the 128-stride bank conflict in ldmatrix.
 // Choose strides ±8 elements (16 bytes) from natural sizes so that 16 rows
 // of a ldmatrix tile hit 16 distinct 32-bit banks.
 constexpr int K_PAD  = K_DIM + 16;  // 144 bf16 (288 B row, 32-B aligned)
 constexpr int Vb_PAD = V_TILE + 16; // 32 bf16 for S_bf (64 B row)
-// Row-stride pads for the small [C][V_TILE] / [C][C] scratch buffers that
-// wmma::{load,store}_matrix_sync hits.  Natural strides (V_TILE=16 bf16,
-// C=16 fp32) hit a power-of-two bank pattern that serializes the half-warp
-// store into 2-way conflicts → 47–53 % excess wavefronts in ncu.  Push
-// strides off the power-of-two boundary:
-//   fp32 [16][16] → [16][20]   (80 B row, 20 banks wide)
-//   bf16 [16][16] → [16][24]   (48 B row,  3 × 16 banks)
-constexpr int VT_PAD_F32 = V_TILE + 4;   // 20 fp32
-constexpr int VT_PAD_BF  = V_TILE + 8;   // 24 bf16
-constexpr int C_PAD_F32  = C      + 4;   // 20 fp32
-constexpr int C_PAD_BF   = C      + 8;   // 24 bf16
 
 static __forceinline__ __device__ void cp_async_16(void* smem_dst, const void* gmem_src) {
   unsigned smem_int = __cvta_generic_to_shared(smem_dst);
@@ -71,7 +59,7 @@ static __forceinline__ __device__ void cp_async_wait_1() {
   asm volatile("cp.async.wait_group 1;\n");
 }
 
-__global__ __launch_bounds__(BLOCK_THREADS, 2)
+__global__ __launch_bounds__(BLOCK_THREADS, 4)
 void gdn_prefill_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ k_ptr,
@@ -104,30 +92,22 @@ void gdn_prefill_kernel(
   const float A_log   = A_log_ptr[h_idx];
   const float dt_bias = dt_bias_ptr[h_idx];
 
-  // ----- Shared memory layout -----------------------------------------------
-  // Static shmem stays under the 48 KB compile-time cap; the big Q/K/V
-  // double-buffers live in dynamic shmem (launched with the right carveout).
-  //
-  // Static (~40 KB at C=32):
-  __shared__ float         S_fp   [K_DIM][V_TILE];          //  8 KB
-  __shared__ __nv_bfloat16 S_bf   [K_DIM][Vb_PAD];          //  8 KB
-  __shared__ __nv_bfloat16 U_smem [C]    [VT_PAD_BF];       //  1.5 KB
-  __shared__ __nv_bfloat16 Ubeta  [C]    [VT_PAD_BF];       //  1.5 KB
-  __shared__ __nv_bfloat16 QKmb   [C]    [C_PAD_BF ];       //  2.5 KB
-  __shared__ float         KS     [C]    [VT_PAD_F32];      //  2.5 KB
-  __shared__ float         QS     [C]    [VT_PAD_F32];      //  2.5 KB
-  __shared__ float         KK     [C]    [C_PAD_F32 ];      //  4.5 KB
-  __shared__ float         QK     [C]    [C_PAD_F32 ];      //  4.5 KB
-  __shared__ float         Attn   [C]    [VT_PAD_F32];      //  2.5 KB
+  // ----- Shared memory (~36KB) ----------------------------------------------
+  __shared__ float         S_fp   [K_DIM][V_TILE];   //  8KB
+  __shared__ __nv_bfloat16 S_bf   [K_DIM][Vb_PAD];   //  8KB (stride 32 to break bank conflicts)
+  __shared__ __nv_bfloat16 Q_smem [2][C][K_PAD];     //  9KB (stride 144)
+  __shared__ __nv_bfloat16 K_smem [2][C][K_PAD];     //  9KB
+  __shared__ __nv_bfloat16 V_smem [2][C][V_TILE];    //  1KB
+  __shared__ __nv_bfloat16 U_smem [C    ][V_TILE];   //  0.5KB
+  __shared__ __nv_bfloat16 Ubeta  [C    ][V_TILE];   //  0.5KB
+  __shared__ __nv_bfloat16 QKmb   [C    ][C    ];    //  0.5KB
+  __shared__ float         KS     [C    ][V_TILE];   //  1KB
+  __shared__ float         QS     [C    ][V_TILE];   //  1KB
+  __shared__ float         KK     [C    ][C    ];    //  1KB
+  __shared__ float         Attn   [C    ][V_TILE];   //  1KB
   __shared__ float         gamma_cum[C];
   __shared__ float         g_arr    [C];
   __shared__ float         beta_arr [C];
-
-  // Dynamic shmem: 2×C×K_PAD×2 B for Q + same for K + 2×C×V_TILE×2 B for V.
-  extern __shared__ __nv_bfloat16 dyn_smem[];
-  __nv_bfloat16 (*Q_smem)[C][K_PAD]  = reinterpret_cast<__nv_bfloat16 (*)[C][K_PAD]>(dyn_smem);
-  __nv_bfloat16 (*K_smem)[C][K_PAD]  = reinterpret_cast<__nv_bfloat16 (*)[C][K_PAD]>(dyn_smem + 2 * C * K_PAD);
-  __nv_bfloat16 (*V_smem)[C][V_TILE] = reinterpret_cast<__nv_bfloat16 (*)[C][V_TILE]>(dyn_smem + 4 * C * K_PAD);
 
   if (seq_len <= 0) {
     float* ns_bh = new_state + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
@@ -213,6 +193,32 @@ void gdn_prefill_kernel(
     }
   };
 
+  // ----- Persistent state fragments (held in registers across chunks) --------
+  // Each warp owns 2 m-tiles: m_off = warp_id*32, warp_id*32+16.
+  // After state update we write fragment→S_bf directly (bf16), avoiding the
+  // fp32 S_fp round-trip per chunk.
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_state[2];
+  __syncthreads();  // wait for S_fp init above to be visible
+  #pragma unroll
+  for (int t_idx = 0; t_idx < 2; ++t_idx) {
+    int m_off = warp_id * 32 + t_idx * 16;
+    wmma::load_matrix_sync(c_state[t_idx], &S_fp[m_off][0], V_TILE, wmma::mem_row_major);
+  }
+  // Initial S_fp → S_bf conversion (subsequent chunks write S_bf from fragments).
+  {
+    constexpr int N_VEC = (K_DIM * V_TILE) / 4;
+    for (int i = tid; i < N_VEC; i += BLOCK_THREADS) {
+      int elem = i * 4;
+      int k  = elem / V_TILE;
+      int vt = elem % V_TILE;
+      float4 f4 = *reinterpret_cast<float4*>(&S_fp[k][vt]);
+      __nv_bfloat162 bf01 = __float22bfloat162_rn(make_float2(f4.x, f4.y));
+      __nv_bfloat162 bf23 = __float22bfloat162_rn(make_float2(f4.z, f4.w));
+      reinterpret_cast<__nv_bfloat162*>(&S_bf[k][vt])[0] = bf01;
+      reinterpret_cast<__nv_bfloat162*>(&S_bf[k][vt])[1] = bf23;
+    }
+  }
+
   // ----- Prologue: issue load for chunk 0 ------------------------------------
   int buf = 0;
   int C_actual0 = min(C, seq_len);
@@ -236,23 +242,9 @@ void gdn_prefill_kernel(
 
     // ------------------------------------------------------------------------
     // OVERLAP WORK — runs in parallel with the in-flight cp.async for chunk N.
-    // Uses S_fp (prev chunk's state) and global a,b (not Q/K/V).
+    // S_bf is already populated (initially from S_fp conversion above the loop;
+    // subsequently by state update's direct bf16 writes at chunk-end).
     // ------------------------------------------------------------------------
-    // Convert fp32 S → bf16 S — vectorized (float4 → 2 bf162)
-    {
-      constexpr int N_VEC = (K_DIM * V_TILE) / 4;
-      for (int i = tid; i < N_VEC; i += BLOCK_THREADS) {
-        int elem = i * 4;
-        int k  = elem / V_TILE;
-        int vt = elem % V_TILE;
-        float4 f4 = *reinterpret_cast<float4*>(&S_fp[k][vt]);
-        __nv_bfloat162 bf01 = __float22bfloat162_rn(make_float2(f4.x, f4.y));
-        __nv_bfloat162 bf23 = __float22bfloat162_rn(make_float2(f4.z, f4.w));
-        reinterpret_cast<__nv_bfloat162*>(&S_bf[k][vt])[0] = bf01;
-        reinterpret_cast<__nv_bfloat162*>(&S_bf[k][vt])[1] = bf23;
-      }
-    }
-
     // Per-token scalars + warp-parallel γ cumprod
     if (warp_id == 0) {
       float g_local = 1.f, beta_local = 0.f;
@@ -312,103 +304,78 @@ void gdn_prefill_kernel(
     //   warp 3: QK = Q @ K^T
     // =======================================================================
     if (warp_id == 0) {
-      // KS = K @ S  [C, K_DIM] @ [K_DIM, V_TILE]  → [C, V_TILE] = C_TILES row-tiles.
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aK[C_TILES];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aK;
       wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bS;
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[C_TILES];
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i) wmma::fill_fragment(c[i], 0.f);
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+      wmma::fill_fragment(c, 0.f);
       #pragma unroll
       for (int k_off = 0; k_off < K_DIM; k_off += 16) {
+        wmma::load_matrix_sync(aK, &K_smem[buf][0][k_off], K_PAD);
         wmma::load_matrix_sync(bS, &S_bf[k_off][0], Vb_PAD);
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i) {
-          wmma::load_matrix_sync(aK[i], &K_smem[buf][i * 16][k_off], K_PAD);
-          wmma::mma_sync(c[i], aK[i], bS, c[i]);
-        }
+        wmma::mma_sync(c, aK, bS, c);
       }
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        wmma::store_matrix_sync(&KS[i * 16][0], c[i], VT_PAD_F32, wmma::mem_row_major);
+      wmma::store_matrix_sync(&KS[0][0], c, V_TILE, wmma::mem_row_major);
     } else if (warp_id == 1) {
-      // QS = Q @ S  — same shape as KS.
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aQ[C_TILES];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aQ;
       wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> bS;
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[C_TILES];
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i) wmma::fill_fragment(c[i], 0.f);
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+      wmma::fill_fragment(c, 0.f);
       #pragma unroll
       for (int k_off = 0; k_off < K_DIM; k_off += 16) {
+        wmma::load_matrix_sync(aQ, &Q_smem[buf][0][k_off], K_PAD);
         wmma::load_matrix_sync(bS, &S_bf[k_off][0], Vb_PAD);
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i) {
-          wmma::load_matrix_sync(aQ[i], &Q_smem[buf][i * 16][k_off], K_PAD);
-          wmma::mma_sync(c[i], aQ[i], bS, c[i]);
-        }
+        wmma::mma_sync(c, aQ, bS, c);
       }
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        wmma::store_matrix_sync(&QS[i * 16][0], c[i], VT_PAD_F32, wmma::mem_row_major);
+      wmma::store_matrix_sync(&QS[0][0], c, V_TILE, wmma::mem_row_major);
     } else if (warp_id == 2) {
-      // KK = K @ K^T  [C, K_DIM] @ [K_DIM, C] → [C, C] = C_TILES × C_TILES tiles.
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aK[C_TILES];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bK[C_TILES];
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[C_TILES][C_TILES];
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        #pragma unroll
-        for (int j = 0; j < C_TILES; ++j) wmma::fill_fragment(c[i][j], 0.f);
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aK;
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bK;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+      wmma::fill_fragment(c, 0.f);
       #pragma unroll
       for (int k_off = 0; k_off < K_DIM; k_off += 16) {
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i) {
-          wmma::load_matrix_sync(aK[i], &K_smem[buf][i * 16][k_off], K_PAD);
-          wmma::load_matrix_sync(bK[i], &K_smem[buf][i * 16][k_off], K_PAD);
-        }
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i)
-          #pragma unroll
-          for (int j = 0; j < C_TILES; ++j)
-            wmma::mma_sync(c[i][j], aK[i], bK[j], c[i][j]);
+        wmma::load_matrix_sync(aK, &K_smem[buf][0][k_off], K_PAD);
+        wmma::load_matrix_sync(bK, &K_smem[buf][0][k_off], K_PAD);
+        wmma::mma_sync(c, aK, bK, c);
       }
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        #pragma unroll
-        for (int j = 0; j < C_TILES; ++j)
-          wmma::store_matrix_sync(&KK[i * 16][j * 16], c[i][j], C_PAD_F32, wmma::mem_row_major);
+      wmma::store_matrix_sync(&KK[0][0], c, C, wmma::mem_row_major);
     } else /* warp_id == 3 */ {
-      // QK = Q @ K^T — same shape as KK.
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aQ[C_TILES];
-      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bK[C_TILES];
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[C_TILES][C_TILES];
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        #pragma unroll
-        for (int j = 0; j < C_TILES; ++j) wmma::fill_fragment(c[i][j], 0.f);
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aQ;
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bK;
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+      wmma::fill_fragment(c, 0.f);
       #pragma unroll
       for (int k_off = 0; k_off < K_DIM; k_off += 16) {
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i) {
-          wmma::load_matrix_sync(aQ[i], &Q_smem[buf][i * 16][k_off], K_PAD);
-          wmma::load_matrix_sync(bK[i], &K_smem[buf][i * 16][k_off], K_PAD);
-        }
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i)
-          #pragma unroll
-          for (int j = 0; j < C_TILES; ++j)
-            wmma::mma_sync(c[i][j], aQ[i], bK[j], c[i][j]);
+        wmma::load_matrix_sync(aQ, &Q_smem[buf][0][k_off], K_PAD);
+        wmma::load_matrix_sync(bK, &K_smem[buf][0][k_off], K_PAD);
+        wmma::mma_sync(c, aQ, bK, c);
       }
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        #pragma unroll
-        for (int j = 0; j < C_TILES; ++j)
-          wmma::store_matrix_sync(&QK[i * 16][j * 16], c[i][j], C_PAD_F32, wmma::mem_row_major);
+      // Skip fp32 QK store: apply causal mask + β multiply + bf16 convert,
+      // and write directly from fragment to QKmb.
+      // Fragment layout: x[0],x[1] at (t=group, s=tip*2,tip*2+1);
+      //                  x[2],x[3] at (t=group+8, s=tip*2,tip*2+1);
+      //                  x[4],x[5] at (t=group, s=tip*2+8,tip*2+9);
+      //                  x[6],x[7] at (t=group+8, s=tip*2+8,tip*2+9);
+      const int group = lane >> 2;
+      const int tip   = lane & 3;
+      const int s0 = tip * 2;
+      const int s8 = tip * 2 + 8;
+      auto pack = [&](int t, int s, float f0, float f1) -> __nv_bfloat162 {
+        float v0 = (s     <= t) ? (f0 * beta_arr[s])     : 0.f;
+        float v1 = (s + 1 <= t) ? (f1 * beta_arr[s + 1]) : 0.f;
+        return __float22bfloat162_rn(make_float2(v0, v1));
+      };
+      *reinterpret_cast<__nv_bfloat162*>(&QKmb[group    ][s0]) = pack(group    , s0, c.x[0], c.x[1]);
+      *reinterpret_cast<__nv_bfloat162*>(&QKmb[group + 8][s0]) = pack(group + 8, s0, c.x[2], c.x[3]);
+      *reinterpret_cast<__nv_bfloat162*>(&QKmb[group    ][s8]) = pack(group    , s8, c.x[4], c.x[5]);
+      *reinterpret_cast<__nv_bfloat162*>(&QKmb[group + 8][s8]) = pack(group + 8, s8, c.x[6], c.x[7]);
     }
     __syncthreads();
 
     // =======================================================================
     // Triangular solve for u — warp 0 only (serial across t, lanes = vt).
-    // Fused: also writes U_smem and Ubeta (β⊙u).
+    // Fused: also writes U_smem and Ubeta (β⊙u).  QKmb is already populated
+    // by warp 3 above (direct fragment write), so other warps have no extra work.
     // =======================================================================
     if (warp_id == 0) {
       float u_reg[C];
@@ -430,42 +397,20 @@ void gdn_prefill_kernel(
         }
       }
     }
-    // QKmb = causal(QK) ⊙ β  (other warps do this while warp 0 solves)
-    if (warp_id != 0) {
-      for (int i = tid - 32; i < C * C; i += BLOCK_THREADS - 32) {
-        if (i >= 0) {
-          int t = i / C, s = i % C;
-          float val = (s <= t) ? (QK[t][s] * beta_arr[s]) : 0.f;
-          QKmb[t][s] = __float2bfloat16(val);
-        }
-      }
-    }
     __syncthreads();
 
     // =======================================================================
     // Matmul 5: Attn = QKmb @ U_smem  [C, C] @ [C, V_TILE]  — warp 0 only
     // =======================================================================
-    // Matmul 5: Attn = QKmb @ U_smem — warp 0 only.
-    // Shape: [C, C] @ [C, V_TILE] = [C, V_TILE].
-    // With C=32, V_TILE=16, this is C_TILES row-tiles × (C_TILES inner reductions).
     if (warp_id == 0) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a[C_TILES];
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
       wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b;
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c[C_TILES];
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i) wmma::fill_fragment(c[i], 0.f);
-      #pragma unroll
-      for (int k_off = 0; k_off < C; k_off += 16) {
-        wmma::load_matrix_sync(b, &U_smem[k_off][0], VT_PAD_BF);
-        #pragma unroll
-        for (int i = 0; i < C_TILES; ++i) {
-          wmma::load_matrix_sync(a[i], &QKmb[i * 16][k_off], C_PAD_BF);
-          wmma::mma_sync(c[i], a[i], b, c[i]);
-        }
-      }
-      #pragma unroll
-      for (int i = 0; i < C_TILES; ++i)
-        wmma::store_matrix_sync(&Attn[i * 16][0], c[i], VT_PAD_F32, wmma::mem_row_major);
+      wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+      wmma::fill_fragment(c, 0.f);
+      wmma::load_matrix_sync(a, &QKmb[0][0], C);
+      wmma::load_matrix_sync(b, &U_smem[0][0], V_TILE);
+      wmma::mma_sync(c, a, b, c);
+      wmma::store_matrix_sync(&Attn[0][0], c, V_TILE, wmma::mem_row_major);
     }
     __syncthreads();
 
@@ -488,28 +433,44 @@ void gdn_prefill_kernel(
       }
     }
 
-    // State update — 8 m-tiles (K_DIM/16), 2 per warp.
-    // Each tile reduces over chunk dim C via C_TILES=2 WMMA ops.
-    // S += K^T[:, m_off:m_off+16] @ Ubeta[:, 0:V_TILE], scaled by γ_C.
+    // State update — 8 m-tiles, 2 per warp.  c_state is persistent across chunks
+    // (no accumulator load).  After mma+scale, convert fragment to bf16 and write
+    // directly to S_bf for the next chunk's matmul — avoids the fp32 S_fp round-trip.
+    //
+    // Fragment layout (m16n16k16 f32 accumulator, 8 elements per lane):
+    //   group = lane/4, tip = lane%4
+    //   x[0],x[1] at (row=group,   col=tip*2  , tip*2+1)
+    //   x[2],x[3] at (row=group+8, col=tip*2  , tip*2+1)
+    //   x[4],x[5] at (row=group,   col=tip*2+8, tip*2+9)
+    //   x[6],x[7] at (row=group+8, col=tip*2+8, tip*2+9)
     {
       const float gC = gamma_cum[C - 1];
       const int m_base = warp_id * 32;
+      const int group = lane >> 2;
+      const int tip   = lane & 3;
+      const int v0 = tip * 2;
+      const int v8 = tip * 2 + 8;
       #pragma unroll
-      for (int dm = 0; dm < 32; dm += 16) {
-        int m_off = m_base + dm;
+      for (int t_idx = 0; t_idx < 2; ++t_idx) {
+        int m_off = m_base + t_idx * 16;
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
-        wmma::load_matrix_sync(c, &S_fp[m_off][0], V_TILE, wmma::mem_row_major);
+        wmma::load_matrix_sync(a, &K_smem[buf][0][m_off], K_PAD);
+        wmma::load_matrix_sync(b, &Ubeta[0][0], V_TILE);
+        wmma::mma_sync(c_state[t_idx], a, b, c_state[t_idx]);
         #pragma unroll
-        for (int k_chunk = 0; k_chunk < C; k_chunk += 16) {
-          wmma::load_matrix_sync(a, &K_smem[buf][k_chunk][m_off], K_PAD);
-          wmma::load_matrix_sync(b, &Ubeta[k_chunk][0], VT_PAD_BF);
-          wmma::mma_sync(c, a, b, c);
-        }
-        #pragma unroll
-        for (int i = 0; i < c.num_elements; ++i) c.x[i] *= gC;
-        wmma::store_matrix_sync(&S_fp[m_off][0], c, V_TILE, wmma::mem_row_major);
+        for (int i = 0; i < c_state[t_idx].num_elements; ++i) c_state[t_idx].x[i] *= gC;
+        // Direct bf16 writes to S_bf at known fragment positions
+        int k_r0 = m_off + group;
+        int k_r1 = m_off + group + 8;
+        __nv_bfloat162 p01 = __float22bfloat162_rn(make_float2(c_state[t_idx].x[0], c_state[t_idx].x[1]));
+        __nv_bfloat162 p23 = __float22bfloat162_rn(make_float2(c_state[t_idx].x[2], c_state[t_idx].x[3]));
+        __nv_bfloat162 p45 = __float22bfloat162_rn(make_float2(c_state[t_idx].x[4], c_state[t_idx].x[5]));
+        __nv_bfloat162 p67 = __float22bfloat162_rn(make_float2(c_state[t_idx].x[6], c_state[t_idx].x[7]));
+        *reinterpret_cast<__nv_bfloat162*>(&S_bf[k_r0][v0]) = p01;
+        *reinterpret_cast<__nv_bfloat162*>(&S_bf[k_r1][v0]) = p23;
+        *reinterpret_cast<__nv_bfloat162*>(&S_bf[k_r0][v8]) = p45;
+        *reinterpret_cast<__nv_bfloat162*>(&S_bf[k_r1][v8]) = p67;
       }
     }
     __syncthreads();
@@ -518,8 +479,15 @@ void gdn_prefill_kernel(
   }
 
   // ===========================================================================
-  // Final state write-back — vectorized float4 stores (V_TILE rows across warps)
+  // Final state write-back — store persistent fragments back to S_fp (fp32),
+  // then vectorized float4 global writes.
   // ===========================================================================
+  #pragma unroll
+  for (int t_idx = 0; t_idx < 2; ++t_idx) {
+    int m_off = warp_id * 32 + t_idx * 16;
+    wmma::store_matrix_sync(&S_fp[m_off][0], c_state[t_idx], V_TILE, wmma::mem_row_major);
+  }
+  __syncthreads();
   float* ns_bh = new_state + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
   #pragma unroll
   for (int vt = warp_id; vt < V_TILE; vt += WARPS) {
@@ -560,22 +528,7 @@ static void run_impl(
   dim3 grid(N * Hv * N_V);
   dim3 block(BLOCK_THREADS);
 
-  // Dynamic shmem holds Q/K/V double buffers for C=32.
-  constexpr int K_PAD_H = K_DIM + 16;
-  constexpr int DYN_BYTES =
-      (2 * 32 * K_PAD_H * 2) +   // Q:  2 × C × K_PAD × sizeof(bf16)
-      (2 * 32 * K_PAD_H * 2) +   // K
-      (2 * 32 * 16 * 2);         // V:  2 × C × V_TILE × sizeof(bf16)
-
-  static bool set_shmem_attr = false;
-  if (!set_shmem_attr) {
-    cudaFuncSetAttribute(gdn_prefill_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         DYN_BYTES);
-    set_shmem_attr = true;
-  }
-
-  gdn_prefill_kernel<<<grid, block, DYN_BYTES, 0>>>(
+  gdn_prefill_kernel<<<grid, block, 0, 0>>>(
       static_cast<const __nv_bfloat16*>(q.data_ptr()),
       static_cast<const __nv_bfloat16*>(k.data_ptr()),
       static_cast<const __nv_bfloat16*>(v.data_ptr()),
