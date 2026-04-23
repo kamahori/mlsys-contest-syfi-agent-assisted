@@ -18,7 +18,7 @@ Per-track flags from `EVALUATION.md`:
 |---|---|
 | **GDN** | **3.43×** arith-mean of prefill + decode |
 | **MoE** | **0.36×** (baseline is ~2.75× faster than us) |
-| **DSA** | indexer correctness **fixed** (128/128 PASS) — pairwise ratio TBD in contest env (baseline broken locally) |
+| **DSA** | indexer 128/128 PASS (1.06× ref); sparse-attn 23/23 PASS (**56× ref**) — pairwise ratio TBD in contest env (both baselines broken locally) |
 
 ## Per-kernel detail
 
@@ -90,7 +90,24 @@ official eval env ships a pinned `deep_gemm` where this matches.
 
 ### DSA sparse attention — `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`
 
-Not submitted.
+| | syfi | flashinfer baseline |
+|---|---|---|
+| solution | `syfi-dsa-sparse-attn-v1` (CUDA, WMMA bf16 flash-decoding, 8-warp, cp.async K gather) | `flashinfer_wrapper_5af199` |
+| correctness | **23 / 23 PASSED** | 0 / 23 (RUNTIME_ERROR: returns-arity bug; 1 tensor returned, 2 expected) |
+| mean speedup vs python ref | **56× arith-mean** (45×–69×) | — |
+| pairwise syfi / baseline | undefined in local env | — |
+
+We tried three implementations (CUDA / Triton / Python+CuTe). All three
+PASSED 23/23 (unlike the indexer, sparse-attn outputs are floats so
+atol=0.01/rtol=0.01 absorbs fp-accumulation-order noise). Speed comparison:
+
+| variant | pass | mean speedup vs python ref |
+|---|---|---|
+| CUDA (WMMA, 8-warp) | 23/23 | **56×** (winner) |
+| Triton (flash-attn, sparse gather) | 23/23 | 19× |
+| Python + CuTe-DSL scale | 23/23 | 4.4× |
+
+We submitted the CUDA variant.
 
 ## Workload totals used in the averages above
 
@@ -100,6 +117,7 @@ Not submitted.
 | GDN decode | 54 | 54 |
 | MoE | 19 | 19 |
 | DSA indexer | 0 (baseline fails locally; syfi all 128 PASS) | 128 |
+| DSA sparse attn | 0 (baseline fails locally; syfi all 23 PASS) | 23 |
 
 ## Scoring formula reminder (from EVALUATION.md)
 
