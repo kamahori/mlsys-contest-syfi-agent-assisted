@@ -34,6 +34,8 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <glob.h>
 #include <string>
 #include <vector>
 
@@ -84,6 +86,36 @@ static CUmodule     g_module = nullptr;
 static CUfunction   g_kernel = nullptr;
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static bool         g_gpu_ok = false;
+
+static void add_existing_dir(std::vector<std::string>* dirs, const char* path) {
+  if (path && path[0] && access(path, R_OK) == 0) dirs->push_back(path);
+}
+
+static void add_existing_dir(std::vector<std::string>* dirs, const std::string& path) {
+  add_existing_dir(dirs, path.c_str());
+}
+
+static void add_globbed_dirs(std::vector<std::string>* dirs, const std::string& pattern) {
+  glob_t matches;
+  std::memset(&matches, 0, sizeof(matches));
+  if (glob(pattern.c_str(), 0, nullptr, &matches) == 0) {
+    for (size_t i = 0; i < matches.gl_pathc; ++i) add_existing_dir(dirs, matches.gl_pathv[i]);
+  }
+  globfree(&matches);
+}
+
+static void* dlopen_first_glob(const std::string& pattern) {
+  glob_t matches;
+  std::memset(&matches, 0, sizeof(matches));
+  void* handle = nullptr;
+  if (glob(pattern.c_str(), 0, nullptr, &matches) == 0) {
+    for (size_t i = 0; i < matches.gl_pathc && !handle; ++i) {
+      handle = dlopen(matches.gl_pathv[i], RTLD_NOW | RTLD_GLOBAL);
+    }
+  }
+  globfree(&matches);
+  return handle;
+}
 
 // ===== Embedded kernel source (compiled by NVRTC at first call) =============
 static const char* KERNEL_SRC = R"CUDA(
@@ -234,12 +266,23 @@ static void init_gpu_impl() {
   if (!g_drv.cuLaunchKernel || !g_drv.cuModuleLoadData || !g_drv.cuModuleGetFunction) return;
   if (g_drv.cuInit) g_drv.cuInit(0);
 
-  // NVRTC: prefer the venv-bundled CUDA-12.8 build (matches the driver).
-  void* libnvrtc = dlopen(
-      "/raid/keisuke/flashinfer-contest/full-agent-pipeline/.venv/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so.12",
-      RTLD_NOW | RTLD_GLOBAL);
-  if (!libnvrtc) libnvrtc = dlopen("libnvrtc.so.12", RTLD_NOW | RTLD_GLOBAL);
+  void* libnvrtc = nullptr;
+  // Prefer the evaluator/container loader paths. If the CUDA Python wheels are
+  // installed in an isolated venv but not on LD_LIBRARY_PATH, discover them
+  // relative to VIRTUAL_ENV without baking in a machine-local absolute path.
+  libnvrtc = dlopen("libnvrtc.so.12", RTLD_NOW | RTLD_GLOBAL);
   if (!libnvrtc) libnvrtc = dlopen("libnvrtc.so",    RTLD_NOW | RTLD_GLOBAL);
+  const char* venv = std::getenv("VIRTUAL_ENV");
+  if (!libnvrtc && venv) {
+    libnvrtc = dlopen_first_glob(
+        std::string(venv) + "/lib/python*/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so*");
+  }
+  if (!libnvrtc) libnvrtc = dlopen_first_glob(
+      "/usr/local/lib/python*/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so*");
+  if (!libnvrtc) libnvrtc = dlopen_first_glob(
+      "/usr/lib/python*/dist-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so*");
+  if (!libnvrtc) libnvrtc = dlopen_first_glob(
+      "/opt/conda/lib/python*/site-packages/nvidia/cuda_nvrtc/lib/libnvrtc.so*");
   if (!libnvrtc) return;
 
   g_nvrtc.nvrtcCreateProgram     = (nvrtcResult(*)(nvrtcProgram*, const char*, const char*, int, const char* const*, const char* const*))
@@ -260,25 +303,35 @@ static void init_gpu_impl() {
 
   // Target compute_90 PTX — driver JITs to sm_100 on Blackwell.
   // Use compute_<n> (PTX), not sm_<n> (cubin), so the JIT can retarget.
-  // NVRTC needs --include-path to find cuda_bf16.h (it ships its own copy
-  // alongside the runtime headers); search a few well-known locations.
+  // NVRTC needs --include-path to find cuda_bf16.h. Search paths that exist in
+  // CUDA Docker images first, then CUDA Python wheel locations inside a venv.
   std::vector<std::string> inc_dirs;
-  const char* candidates[] = {
-      "/raid/keisuke/flashinfer-contest/full-agent-pipeline/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/include",
-      "/raid/keisuke/flashinfer-contest/flashinfer-bench-starter-kit/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/include",
-      "/usr/local/cuda-12.8/include",
-      "/usr/local/cuda/include",
-  };
-  for (const char* p : candidates) {
-    if (access(p, R_OK) == 0) inc_dirs.push_back(std::string("--include-path=") + p);
+  const char* cuda_home = std::getenv("CUDA_HOME");
+  const char* cuda_path = std::getenv("CUDA_PATH");
+  if (cuda_home) add_existing_dir(&inc_dirs, std::string(cuda_home) + "/include");
+  if (cuda_path) add_existing_dir(&inc_dirs, std::string(cuda_path) + "/include");
+  add_existing_dir(&inc_dirs, "/usr/local/cuda/include");
+  add_globbed_dirs(&inc_dirs, "/usr/local/cuda-*/include");
+  if (venv) {
+    add_globbed_dirs(&inc_dirs,
+        std::string(venv) + "/lib/python*/site-packages/nvidia/cuda_runtime/include");
   }
+  add_globbed_dirs(&inc_dirs,
+      "/usr/local/lib/python*/site-packages/nvidia/cuda_runtime/include");
+  add_globbed_dirs(&inc_dirs,
+      "/usr/lib/python*/dist-packages/nvidia/cuda_runtime/include");
+  add_globbed_dirs(&inc_dirs,
+      "/opt/conda/lib/python*/site-packages/nvidia/cuda_runtime/include");
 
   std::vector<const char*> opts;
   opts.push_back("--gpu-architecture=compute_90");
   opts.push_back("--use_fast_math");
   opts.push_back("-default-device");
   opts.push_back("-std=c++17");
-  for (auto& s : inc_dirs) opts.push_back(s.c_str());
+  std::vector<std::string> include_opts;
+  include_opts.reserve(inc_dirs.size());
+  for (const auto& s : inc_dirs) include_opts.push_back(std::string("--include-path=") + s);
+  for (auto& s : include_opts) opts.push_back(s.c_str());
 
   nvrtcResult cr = g_nvrtc.nvrtcCompileProgram(prog, (int)opts.size(), opts.data());
   if (cr != 0) {
