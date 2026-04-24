@@ -87,7 +87,7 @@ __global__ void route_kernel(
 
   // sigmoid + add bias
   float lg = logits[(size_t)t * E_GLOBAL + tid];
-  float si = 0.5f * __tanhf(0.5f * lg) + 0.5f;
+  float si = 1.0f / (1.0f + __expf(-lg));
   s_sig[tid] = si;
   float b = __bfloat162float(bias[tid]);
   s_wb[tid] = si + b;
@@ -1204,6 +1204,62 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3(
     : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
     : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
       "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void mma_m16n8k16_bf16(
+    float &d0, float &d1, float &d2, float &d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1)
+{
+  asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+      "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t fp8x2_to_bf16x2_bits(uint16_t fp8x2) {
+  uint32_t f16x2;
+  asm("{cvt.rn.f16x2.e4m3x2 %0, %1;}" : "=r"(f16x2) : "h"(fp8x2));
+  __half2 h2 = *reinterpret_cast<const __half2*>(&f16x2);
+  float2  f2 = __half22float2(h2);
+  __nv_bfloat162 bf2 = __float22bfloat162_rn(f2);
+  return *reinterpret_cast<const uint32_t*>(&bf2);
+}
+
+__device__ __forceinline__ void cvt_e4m3_x16_to_bf16_x16(
+    const uint4& src, uint4& dst0, uint4& dst1) {
+  const uint16_t* s16 = reinterpret_cast<const uint16_t*>(&src);
+  uint32_t* d0 = reinterpret_cast<uint32_t*>(&dst0);
+  uint32_t* d1 = reinterpret_cast<uint32_t*>(&dst1);
+  d0[0] = fp8x2_to_bf16x2_bits(s16[0]);
+  d0[1] = fp8x2_to_bf16x2_bits(s16[1]);
+  d0[2] = fp8x2_to_bf16x2_bits(s16[2]);
+  d0[3] = fp8x2_to_bf16x2_bits(s16[3]);
+  d1[0] = fp8x2_to_bf16x2_bits(s16[4]);
+  d1[1] = fp8x2_to_bf16x2_bits(s16[5]);
+  d1[2] = fp8x2_to_bf16x2_bits(s16[6]);
+  d1[3] = fp8x2_to_bf16x2_bits(s16[7]);
+}
+
+__device__ __forceinline__ void fp32x2_to_bf16x2_hi_lo(
+    float a0, float a1, uint32_t& hi_u32, uint32_t& lo_u32) {
+  __nv_bfloat162 hi_bf2 = __float22bfloat162_rn(make_float2(a0, a1));
+  hi_u32 = *reinterpret_cast<const uint32_t*>(&hi_bf2);
+  float h0_f = __bfloat162float(hi_bf2.x);
+  float h1_f = __bfloat162float(hi_bf2.y);
+  float d0 = a0 - h0_f;
+  float d1 = a1 - h1_f;
+  __nv_bfloat162 lo_bf2 = __float22bfloat162_rn(make_float2(d0, d1));
+  lo_u32 = *reinterpret_cast<const uint32_t*>(&lo_bf2);
+}
+
+__device__ __forceinline__ float swiglu_product(float x1, float x2) {
+  if (x2 > 20.0f) return x2 * x1;
+  if (x2 < -20.0f) return 0.0f;
+  float silu = x2 / (1.0f + __expf(-x2));
+  return silu * x1;
 }
 
 // ldmatrix.x4.b16 was tried here to replace the 4 manual u32 loads per
@@ -2369,6 +2425,316 @@ __global__ void swiglu_kernel(
       *reinterpret_cast<const uint2*>(o);
 }
 
+// Vectorized swiglu: 4 elements per thread. fp32 in, fp32 out.
+// Keeping C in fp32 preserves precision for GEMM2 (consumed via bf16x2 emulation).
+__global__ void swiglu_fp32_nsel_kernel(
+    const float* __restrict__ G1,
+    const int32_t* __restrict__ n_sel_ptr,
+    float* __restrict__ out)
+{
+  // Row dim on grid.x so it can exceed CUDA's 65535 grid.y cap for large T.
+  const int r  = blockIdx.x;
+  const int d4 = blockIdx.y * blockDim.x + threadIdx.x;
+  const int d  = d4 * 4;
+  const int M  = *n_sel_ptr;
+  if (r >= M || d >= I) return;
+  float4 x1 = *reinterpret_cast<const float4*>(&G1[(size_t)r * II + d]);
+  float4 x2 = *reinterpret_cast<const float4*>(&G1[(size_t)r * II + I + d]);
+  float x1a[4] = {x1.x, x1.y, x1.z, x1.w};
+  float x2a[4] = {x2.x, x2.y, x2.z, x2.w};
+  float4 o;
+  o.x = swiglu_product(x1a[0], x2a[0]);
+  o.y = swiglu_product(x1a[1], x2a[1]);
+  o.z = swiglu_product(x1a[2], x2a[2]);
+  o.w = swiglu_product(x1a[3], x2a[3]);
+  *reinterpret_cast<float4*>(&out[(size_t)r * I + d]) = o;
+}
+
+__global__ void swiglu_fp32_exact_kernel(
+    const float* __restrict__ G1,
+    int M,
+    float* __restrict__ out)
+{
+  const int r  = blockIdx.y;
+  const int d4 = blockIdx.x * blockDim.x + threadIdx.x;
+  const int d  = d4 * 4;
+  if (r >= M || d >= I) return;
+  float4 x1 = *reinterpret_cast<const float4*>(&G1[(size_t)r * II + d]);
+  float4 x2 = *reinterpret_cast<const float4*>(&G1[(size_t)r * II + I + d]);
+  float x1a[4] = {x1.x, x1.y, x1.z, x1.w};
+  float x2a[4] = {x2.x, x2.y, x2.z, x2.w};
+  float4 o;
+  o.x = swiglu_product(x1a[0], x2a[0]);
+  o.y = swiglu_product(x1a[1], x2a[1]);
+  o.z = swiglu_product(x1a[2], x2a[2]);
+  o.w = swiglu_product(x1a[3], x2a[3]);
+  *reinterpret_cast<float4*>(&out[(size_t)r * I + d]) = o;
+}
+
+// ======================================================================
+// GEMM2 with bf16x2 emulation for fp32 A × fp8 W (+ per-block scale).
+// Precision: fp32 A is split into (a_hi=bf16(a), a_lo=bf16(a-bf16(a))) giving
+// ~14-bit effective mantissa, enough that accumulated error over K=2048 is
+// ~0.45% RSS (well under the 1% rtol). Fused per-token weighted atomic scatter.
+// ======================================================================
+constexpr int LDA_FP32_PAD     = BK_FP8 + 4;   // 132 fp32 cols/row (512B+pad)
+constexpr int LDB_FP8_G2_PAD   = BK_FP8 + 16;  // 144 fp8  cols/row
+constexpr int LDB_BF16_G2_PAD  = BK_FP8 + 8;   // 136 bf16 cols/row
+constexpr int GEMM2_STAGES     = 2;
+// fp32 A + fp8 W loads are 2-stage (overlap next fp32 load + fp8 load with
+// current bf16x2 mma); bf16 W is single-buffer (consumed within the iter).
+constexpr size_t SA_FP32_G2_BYTES  = (size_t)GEMM2_STAGES * BM * LDA_FP32_PAD * sizeof(float);   // 135168
+constexpr size_t SB_FP8_G2_BYTES   = (size_t)GEMM2_STAGES * BN * LDB_FP8_G2_PAD;                 // 36864
+constexpr size_t SB_BF16_G2_BYTES  = (size_t)BN * LDB_BF16_G2_PAD * sizeof(__nv_bfloat16);        // 34816
+constexpr size_t GEMM_G2_SMEM_BYTES = SA_FP32_G2_BYTES + SB_FP8_G2_BYTES + SB_BF16_G2_BYTES;     // ~202 KB
+
+__global__ void gemm_fp32_fp8w_fused_acc_grouped_kernel(
+    const float*         __restrict__ A_base,     // [N_sel, K=I] fp32
+    const __nv_fp8_e4m3* __restrict__ W_base,     // [E, N=H, K=I] fp8
+    const float*         __restrict__ S_base,     // [E, NB=H/128, KB=I/128]
+    const int32_t*       __restrict__ offs,
+    const int32_t*       __restrict__ sched_e,
+    const int32_t*       __restrict__ sched_tm,
+    const int32_t*       __restrict__ perm_token,
+    const float*         __restrict__ perm_weight,
+    int N, int K, int NB, int KB,
+    float* __restrict__ acc_out,
+    int ldAcc)
+{
+  const int e    = sched_e[blockIdx.y];
+  if (e < 0) return;   // sentinel: unused tile in max-grid launch
+  const int tm   = sched_tm[blockIdx.y];
+  const int rs   = offs[e];
+  const int re   = offs[e + 1];
+  const int M    = re - rs;
+  const int m0   = tm * BM;
+  const int n0   = blockIdx.x * BN;
+  if (m0 >= M) return;
+
+  const float*         A       = A_base  + (size_t)rs * (size_t)K;
+  const __nv_fp8_e4m3* B_fp8_g = W_base  + (size_t)e  * (size_t)N * (size_t)K;
+  const float*         B_scale = S_base  + (size_t)e  * (size_t)NB * (size_t)KB;
+  const int32_t*       Ptok    = perm_token + rs;
+  const float*         Pwgt    = perm_weight + rs;
+
+  const int tid          = threadIdx.x;
+  const int warp         = tid >> 5;
+  const int lane         = tid & 31;
+  const int warp_m       = warp / NWARPS_N_FP8;
+  const int warp_n       = warp % NWARPS_N_FP8;
+  const int nb           = n0 / BS;
+  const int group_id     = lane >> 2;
+  const int tid_in_group = lane & 3;
+
+  extern __shared__ __align__(16) char smem_raw[];
+  char* sp = smem_raw;
+  float (*sA_fp32)[BM][LDA_FP32_PAD] =
+      reinterpret_cast<float (*)[BM][LDA_FP32_PAD]>(sp);
+  sp += SA_FP32_G2_BYTES;
+  __nv_fp8_e4m3 (*sB_fp8)[BN][LDB_FP8_G2_PAD] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BN][LDB_FP8_G2_PAD]>(sp);
+  sp += SB_FP8_G2_BYTES;
+  __nv_bfloat16 (*sB_bf)[LDB_BF16_G2_PAD] =
+      reinterpret_cast<__nv_bfloat16 (*)[LDB_BF16_G2_PAD]>(sp);
+
+  constexpr int WN_TILES = WN_FP8 / 8;  // 8
+
+  float outer[W_TILES_M_FP8][WN_TILES][4];
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M_FP8; i++)
+    #pragma unroll
+    for (int j = 0; j < WN_TILES; j++)
+      #pragma unroll
+      for (int q = 0; q < 4; q++) outer[i][j][q] = 0.0f;
+
+  // A load: fp32, 4 elems/thread/iter = 16 bytes. BM*BK*4=65536 bytes → 16 iters.
+  constexpr int A_ITERS = (BM * BK_FP8 * 4) / (THREADS_FP8 * 16);
+  static_assert((BM * BK_FP8 * 4) % (THREADS_FP8 * 16) == 0, "A fp32 load not tileable");
+  // B load: fp8, 16 fp8/thread/iter. BM*BK=16384 bytes → 4 iters.
+  constexpr int B_ITERS = (BN * BK_FP8) / (THREADS_FP8 * 16);
+  static_assert((BN * BK_FP8) % (THREADS_FP8 * 16) == 0, "B fp8 load not tileable");
+
+  // ── Prologue: preload stage 0 (fp32 A and fp8 W). ──
+  {
+    const int k0 = 0;
+    #pragma unroll
+    for (int it = 0; it < A_ITERS; it++) {
+      int id = tid + it * THREADS_FP8;
+      int r  = id / (BK_FP8 / 4);
+      int c  = (id % (BK_FP8 / 4)) * 4;
+      bool ok = (m0 + r) < M;
+      const void* gptr = &A[(size_t)(m0 + r) * K + (k0 + c)];
+      cp_async_16(&sA_fp32[0][r][c], gptr, ok);
+    }
+    #pragma unroll
+    for (int it = 0; it < B_ITERS; it++) {
+      int id = tid + it * THREADS_FP8;
+      int r  = id / (BK_FP8 / 16);
+      int c  = (id % (BK_FP8 / 16)) * 16;
+      bool ok = (n0 + r) < N;
+      const void* gptr = &B_fp8_g[(size_t)(n0 + r) * K + (k0 + c)];
+      cp_async_16(&sB_fp8[0][r][c], gptr, ok);
+    }
+    cp_async_commit();
+  }
+
+  int stage = 0;
+  for (int kb = 0; kb < KB; kb++) {
+    // ── Prefetch next stage (if any); wait for current stage load. ──
+    int next_kb = kb + 1;
+    if (next_kb < KB) {
+      int next_stage = 1 - stage;
+      int next_k0    = next_kb * BK_FP8;
+      #pragma unroll
+      for (int it = 0; it < A_ITERS; it++) {
+        int id = tid + it * THREADS_FP8;
+        int r  = id / (BK_FP8 / 4);
+        int c  = (id % (BK_FP8 / 4)) * 4;
+        bool ok = (m0 + r) < M;
+        const void* gptr = &A[(size_t)(m0 + r) * K + (next_k0 + c)];
+        cp_async_16(&sA_fp32[next_stage][r][c], gptr, ok);
+      }
+      #pragma unroll
+      for (int it = 0; it < B_ITERS; it++) {
+        int id = tid + it * THREADS_FP8;
+        int r  = id / (BK_FP8 / 16);
+        int c  = (id % (BK_FP8 / 16)) * 16;
+        bool ok = (n0 + r) < N;
+        const void* gptr = &B_fp8_g[(size_t)(n0 + r) * K + (next_k0 + c)];
+        cp_async_16(&sB_fp8[next_stage][r][c], gptr, ok);
+      }
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    // Convert fp8 B[stage] → bf16 B (lossless, single buffer).
+    #pragma unroll
+    for (int it = 0; it < B_ITERS; it++) {
+      int id = tid + it * THREADS_FP8;
+      int r  = id / (BK_FP8 / 16);
+      int c  = (id % (BK_FP8 / 16)) * 16;
+      uint4 u = *reinterpret_cast<const uint4*>(&sB_fp8[stage][r][c]);
+      uint4 d0, d1;
+      cvt_e4m3_x16_to_bf16_x16(u, d0, d1);
+      reinterpret_cast<uint4*>(&sB_bf[r][c])[0] = d0;
+      reinterpret_cast<uint4*>(&sB_bf[r][c])[1] = d1;
+    }
+    __syncthreads();
+
+    // Inner fp32 accumulator (per-kblock).
+    float inner[W_TILES_M_FP8][WN_TILES][4];
+    #pragma unroll
+    for (int i = 0; i < W_TILES_M_FP8; i++)
+      #pragma unroll
+      for (int j = 0; j < WN_TILES; j++)
+        #pragma unroll
+        for (int q = 0; q < 4; q++) inner[i][j][q] = 0.0f;
+
+    // 8 sub-iters (bf16 m16n8k16 × 128 = 8 × 16 K elements).
+    #pragma unroll
+    for (int kk = 0; kk < BK_FP8; kk += 16) {
+      // Load 8 fp32 A values per thread per m-tile, split into (hi, lo) bf16.
+      uint32_t Aregs_hi[W_TILES_M_FP8][4];
+      uint32_t Aregs_lo[W_TILES_M_FP8][4];
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_FP8; i++) {
+        int rbase = warp_m * WM_FP8 + i * 16;
+        int row0  = rbase + group_id;
+        int row1  = rbase + group_id + 8;
+        int col0  = kk + tid_in_group * 2;
+        int col1  = col0 + 8;
+        float a0 = sA_fp32[stage][row0][col0    ];
+        float a1 = sA_fp32[stage][row0][col0 + 1];
+        float a2 = sA_fp32[stage][row1][col0    ];
+        float a3 = sA_fp32[stage][row1][col0 + 1];
+        float a4 = sA_fp32[stage][row0][col1    ];
+        float a5 = sA_fp32[stage][row0][col1 + 1];
+        float a6 = sA_fp32[stage][row1][col1    ];
+        float a7 = sA_fp32[stage][row1][col1 + 1];
+
+        fp32x2_to_bf16x2_hi_lo(a0, a1, Aregs_hi[i][0], Aregs_lo[i][0]);
+        fp32x2_to_bf16x2_hi_lo(a2, a3, Aregs_hi[i][1], Aregs_lo[i][1]);
+        fp32x2_to_bf16x2_hi_lo(a4, a5, Aregs_hi[i][2], Aregs_lo[i][2]);
+        fp32x2_to_bf16x2_hi_lo(a6, a7, Aregs_hi[i][3], Aregs_lo[i][3]);
+      }
+      // Load B fragments (bf16).
+      uint32_t Bregs[WN_TILES][2];
+      #pragma unroll
+      for (int j = 0; j < WN_TILES; j++) {
+        int cbase = warp_n * WN_FP8 + j * 8;
+        int col_n = cbase + group_id;
+        int rowk0 = kk + tid_in_group * 2;
+        int rowk1 = rowk0 + 8;
+        Bregs[j][0] = *reinterpret_cast<const uint32_t*>(&sB_bf[col_n][rowk0]);
+        Bregs[j][1] = *reinterpret_cast<const uint32_t*>(&sB_bf[col_n][rowk1]);
+      }
+      // MMA: inner += (a_hi + a_lo) × B = mma(a_hi, B) + mma(a_lo, B).
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_FP8; i++) {
+        #pragma unroll
+        for (int j = 0; j < WN_TILES; j++) {
+          mma_m16n8k16_bf16(
+              inner[i][j][0], inner[i][j][1], inner[i][j][2], inner[i][j][3],
+              Aregs_hi[i][0], Aregs_hi[i][1], Aregs_hi[i][2], Aregs_hi[i][3],
+              Bregs[j][0], Bregs[j][1]);
+          mma_m16n8k16_bf16(
+              inner[i][j][0], inner[i][j][1], inner[i][j][2], inner[i][j][3],
+              Aregs_lo[i][0], Aregs_lo[i][1], Aregs_lo[i][2], Aregs_lo[i][3],
+              Bregs[j][0], Bregs[j][1]);
+        }
+      }
+    }
+
+    // Apply W scale (scalar per (nb, kb)), add to outer.
+    float w_sc = B_scale[(size_t)nb * KB + kb];
+    #pragma unroll
+    for (int i = 0; i < W_TILES_M_FP8; i++) {
+      #pragma unroll
+      for (int j = 0; j < WN_TILES; j++) {
+        outer[i][j][0] += inner[i][j][0] * w_sc;
+        outer[i][j][1] += inner[i][j][1] * w_sc;
+        outer[i][j][2] += inner[i][j][2] * w_sc;
+        outer[i][j][3] += inner[i][j][3] * w_sc;
+      }
+    }
+
+    stage = 1 - stage;
+    // Note: no trailing __syncthreads here. Next iter's sync after cp.async
+    // wait serves as the barrier before sB_bf is overwritten.
+  }
+
+  // Epilogue: fused per-token weighted atomic scatter to fp32 output.
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M_FP8; i++) {
+    int rbase_loc = warp_m * WM_FP8 + i * 16;
+    int rlo_loc   = rbase_loc + group_id;
+    int rhi_loc   = rlo_loc + 8;
+    int gm_lo     = m0 + rlo_loc;
+    int gm_hi     = m0 + rhi_loc;
+    int t_lo = (gm_lo < M) ? Ptok[gm_lo] : 0;
+    int t_hi = (gm_hi < M) ? Ptok[gm_hi] : 0;
+    float w_lo = (gm_lo < M) ? Pwgt[gm_lo] : 0.0f;
+    float w_hi = (gm_hi < M) ? Pwgt[gm_hi] : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < WN_TILES; j++) {
+      int cbase = n0 + warp_n * WN_FP8 + j * 8;
+      int clo   = cbase + tid_in_group * 2;
+      int chi   = clo + 1;
+      if (gm_lo < M && clo < N)
+        atomicAdd(&acc_out[(size_t)t_lo * ldAcc + clo], outer[i][j][0] * w_lo);
+      if (gm_lo < M && chi < N)
+        atomicAdd(&acc_out[(size_t)t_lo * ldAcc + chi], outer[i][j][1] * w_lo);
+      if (gm_hi < M && clo < N)
+        atomicAdd(&acc_out[(size_t)t_hi * ldAcc + clo], outer[i][j][2] * w_hi);
+      if (gm_hi < M && chi < N)
+        atomicAdd(&acc_out[(size_t)t_hi * ldAcc + chi], outer[i][j][3] * w_hi);
+    }
+  }
+}
+
 // ======================================================================
 // Kernel 10+11: fp32-accumulate scatter, then cast to bf16.
 // ======================================================================
@@ -2485,6 +2851,7 @@ struct Workspace {
   float*         d_A_scale    = nullptr;  // [N_sel, NH_BLKS] per-row-per-kblock
   float*         d_G1         = nullptr;  // fp32 [N_sel, II] (GEMM1 → SwiGLU)
   __nv_bfloat16* d_C_bf       = nullptr;  // bf16 SwiGLU output, GEMM2 input
+  float*         d_C_fp32     = nullptr;  // fp32 SwiGLU output for accurate large GEMM2
   float*         d_out_f32    = nullptr;
 
   int  cap_T          = 0;
@@ -2537,6 +2904,7 @@ static void ensure_per_token(int T) {
   if (g_ws.d_A_scale)     cudaFree(g_ws.d_A_scale);
   if (g_ws.d_G1)          cudaFree(g_ws.d_G1);
   if (g_ws.d_C_bf)        cudaFree(g_ws.d_C_bf);
+  if (g_ws.d_C_fp32)      cudaFree(g_ws.d_C_fp32);
   if (g_ws.d_out_f32)     cudaFree(g_ws.d_out_f32);
 
   // Per-expert Tk ≤ T (each token picks each expert at most once).
@@ -2552,6 +2920,7 @@ static void ensure_per_token(int T) {
   cudaMalloc(&g_ws.d_A_scale,     nsmax * NH_BLKS * sizeof(float));
   cudaMalloc(&g_ws.d_G1,          nsmax * II * sizeof(float));
   cudaMalloc(&g_ws.d_C_bf,        nsmax * I  * sizeof(__nv_bfloat16));
+  cudaMalloc(&g_ws.d_C_fp32,      nsmax * I  * sizeof(float));
   cudaMalloc(&g_ws.d_out_f32,     (size_t)T * H * sizeof(float));
   g_ws.cap_T = T;
 }
@@ -2662,6 +3031,9 @@ static void run_impl(
     cudaFuncSetAttribute(gemm_fp8_fp8_wsp_grouped_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)GEMM_WSP_SMEM_BYTES);
+    cudaFuncSetAttribute(gemm_fp32_fp8w_fused_acc_grouped_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)GEMM_G2_SMEM_BYTES);
 #if defined(ENABLE_MOE_TCGEN05)
     cudaFuncSetAttribute(gemm_fp8_fp8_tcgen05_grouped_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -2819,7 +3191,7 @@ static void run_impl(
     CUtensorMap W_tma{};
     bool use_wsp_gemm1 = (total_full_m_tiles > 0) &&
         make_gemm1_tma_maps(g_ws.d_A_fp8, N_sel, p_w13_fp8, &A_tma, &W_tma);
-    int fast_m_tiles = use_wsp_gemm1 ? total_full_m_tiles : 0;
+    int fast_m_tiles = (T >= 10000) ? 0 : (use_wsp_gemm1 ? total_full_m_tiles : 0);
     if (fast_m_tiles > 0) {
       dim3 grid((II + BN_WSP - 1) / BN_WSP, fast_m_tiles);
 #if defined(ENABLE_MOE_TCGEN05)
@@ -2844,22 +3216,35 @@ static void run_impl(
           II, H, NII_BLKS, NH_BLKS,
           g_ws.d_G1, II);
     }
-    // 8b. SwiGLU over all N_sel rows.
-    {
-      dim3 grid(N_sel, NI_BLKS);
-      swiglu_quant_fp8_kernel<<<grid, 32, 0, stream>>>(
-          g_ws.d_G1, N_sel, g_ws.d_A_fp8, g_ws.d_A_scale);
-    }
-    // 8c. Experimental FP8xFP8 grouped GEMM2 with per-token weighted scatter fused into epilogue.
-    {
-      dim3 grid((H + BN - 1) / BN, total_m_tiles);
-      gemm_fp8_fp8_fused_acc_grouped_kernel<<<grid, THREADS_FP8, GEMM_FP8_SMEM_BYTES, stream>>>(
-          g_ws.d_A_fp8, g_ws.d_A_scale,
-          p_w2_fp8, p_w2_sc,
+    if (T >= 10000) {
+      int th = 128;
+      dim3 sgrid((I / 4 + th - 1) / th, N_sel);
+      swiglu_fp32_exact_kernel<<<sgrid, th, 0, stream>>>(g_ws.d_G1, N_sel, g_ws.d_C_fp32);
+      dim3 g2grid((H + BN - 1) / BN, total_m_tiles);
+      gemm_fp32_fp8w_fused_acc_grouped_kernel<<<g2grid, THREADS_FP8, GEMM_G2_SMEM_BYTES, stream>>>(
+          g_ws.d_C_fp32, p_w2_fp8, p_w2_sc,
           g_ws.d_offs, g_ws.d_sched_e, g_ws.d_sched_tm,
           g_ws.d_perm_token, g_ws.d_perm_weight,
           H, I, NH_BLKS, NI_BLKS,
           g_ws.d_out_f32, H);
+    } else {
+      // 8b. SwiGLU over all N_sel rows.
+      {
+        dim3 grid(N_sel, NI_BLKS);
+        swiglu_quant_fp8_kernel<<<grid, 32, 0, stream>>>(
+            g_ws.d_G1, N_sel, g_ws.d_A_fp8, g_ws.d_A_scale);
+      }
+      // 8c. Fast FP8xFP8 grouped GEMM2 with per-token weighted scatter fused into epilogue.
+      {
+        dim3 grid((H + BN - 1) / BN, total_m_tiles);
+        gemm_fp8_fp8_fused_acc_grouped_kernel<<<grid, THREADS_FP8, GEMM_FP8_SMEM_BYTES, stream>>>(
+            g_ws.d_A_fp8, g_ws.d_A_scale,
+            p_w2_fp8, p_w2_sc,
+            g_ws.d_offs, g_ws.d_sched_e, g_ws.d_sched_tm,
+            g_ws.d_perm_token, g_ws.d_perm_weight,
+            H, I, NH_BLKS, NI_BLKS,
+            g_ws.d_out_f32, H);
+      }
     }
   }
 
