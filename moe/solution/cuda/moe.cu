@@ -32,6 +32,8 @@
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/function.h>
 
+#define ENABLE_MOE_TCGEN05 1
+
 using namespace nvcuda;
 
 namespace {
@@ -1189,6 +1191,85 @@ __device__ __forceinline__ void cp_async_bulk_tensor_3d_shared_global(
       :: "r"(sdstaddr), "l"(tmap), "r"(c0), "r"(c1), "r"(c2), "r"(mbaraddr) : "memory");
 }
 
+#if defined(ENABLE_MOE_TCGEN05)
+__device__ __forceinline__ void tcgen05_alloc_1sm(uint32_t* dst, uint32_t cols) {
+  unsigned addr = __cvta_generic_to_shared(dst);
+  asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+               :: "r"(addr), "r"(cols) : "memory");
+}
+
+__device__ __forceinline__ void tcgen05_dealloc_1sm(uint32_t taddr, uint32_t cols) {
+  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+               :: "r"(taddr), "r"(cols) : "memory");
+}
+
+__device__ __forceinline__ void tcgen05_relinquish_1sm() {
+  asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void tcgen05_commit_mbarrier(uint64_t* bar) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64 [%0];"
+               :: "r"(addr) : "memory");
+}
+
+__device__ __forceinline__ uint64_t make_tcgen05_smem_desc(
+    const void* ptr, uint32_t leading_bytes, uint32_t stride_bytes) {
+  uint64_t addr = __cvta_generic_to_shared(ptr);
+  uint64_t start = (addr & 0x3ffffull) >> 4;
+  uint64_t leading = (static_cast<uint64_t>(leading_bytes) & 0x3ffffull) >> 4;
+  uint64_t stride = (static_cast<uint64_t>(stride_bytes) & 0x3ffffull) >> 4;
+  return start | (leading << 16) | (stride << 32) | (1ull << 46);
+}
+
+__device__ __forceinline__ uint32_t make_tcgen05_f8_idesc_128x128(
+    bool a_mn_major, bool b_mn_major) {
+  uint32_t desc = 0;
+  desc |= 1u << 4;                         // C format: f32
+  desc |= (a_mn_major ? 1u : 0u) << 15;    // A major
+  desc |= (b_mn_major ? 1u : 0u) << 16;    // B major
+  desc |= (128u >> 3) << 17;               // N dim
+  desc |= (128u >> 4) << 24;               // M dim
+  return desc;
+}
+
+__device__ __forceinline__ void tcgen05_mma_f8f6f4_128x128(
+    uint32_t tmem_c, uint64_t desc_a, uint64_t desc_b,
+    uint32_t idesc, bool accumulate) {
+  uint32_t mask[4] = {0, 0, 0, 0};
+  uint32_t scale_c = accumulate ? 1u : 0u;
+  asm volatile(
+    "{\n\t"
+    ".reg .pred p;\n\t"
+    "setp.ne.b32 p, %4, 0;\n\t"
+    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, {%5, %6, %7, %8}, p;\n\t"
+    "}\n"
+    :: "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(scale_c),
+       "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3])
+    : "memory");
+}
+
+__device__ __forceinline__ float tcgen05_ld_f32(uint32_t taddr) {
+  uint32_t bits;
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x1.b32 {%0}, [%1];"
+               : "=r"(bits) : "r"(taddr) : "memory");
+  asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+  return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ void tcgen05_ld_x4_f32(
+    uint32_t taddr, float& f0, float& f1, float& f2, float& f3) {
+  uint32_t b0, b1, b2, b3;
+  asm volatile("tcgen05.ld.sync.aligned.32x32b.x4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(taddr) : "memory");
+  asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+  f0 = __uint_as_float(b0);
+  f1 = __uint_as_float(b1);
+  f2 = __uint_as_float(b2);
+  f3 = __uint_as_float(b3);
+}
+#endif
+
 template <int THREADS>
 __device__ __forceinline__ void stage_load_A_fp8_BK128(
     __nv_fp8_e4m3 (*sA)[LDA_FP8_PAD],
@@ -1431,6 +1512,7 @@ constexpr int BN_WSP             = 128;
 constexpr int BK_WSP             = BK_FP8;   // 128
 constexpr int LDA_WSP_PAD        = BK_WSP;
 constexpr int LDB_WSP_PAD        = BK_WSP + 16;
+constexpr int LDB_TC_PAD         = BK_WSP;
 constexpr int STAGES_WSP         = 2;
 constexpr int NPROD_WARPS        = 4;
 constexpr int NCONS_WARPS        = 4;
@@ -1446,8 +1528,11 @@ constexpr int W_TILES_M_CONS     = WM_CONS / 16;                        // 4
 constexpr int W_TILES_N_CONS     = WN_CONS / 8;                         // 4
 constexpr size_t SA_WSP_BYTES    = (size_t)STAGES_WSP * BM     * LDA_WSP_PAD;
 constexpr size_t SB_WSP_BYTES    = (size_t)STAGES_WSP * BN_WSP * LDB_WSP_PAD;
+constexpr size_t SB_TC_BYTES     = (size_t)STAGES_WSP * BN_WSP * LDB_TC_PAD;
 constexpr size_t GEMM_WSP_SMEM_BYTES =
     SA_WSP_BYTES + SB_WSP_BYTES + 128;  // dynamic base alignment slack
+constexpr size_t GEMM_TC_SMEM_BYTES =
+    SA_WSP_BYTES + SB_TC_BYTES + 1024;
 
 template <int THREADS>
 __device__ __forceinline__ void stage_load_A_wsp(
@@ -1470,6 +1555,24 @@ __device__ __forceinline__ void stage_load_A_wsp(
 template <int THREADS>
 __device__ __forceinline__ void stage_load_B_wsp(
     __nv_fp8_e4m3 (*sB)[LDB_WSP_PAD],
+    const __nv_fp8_e4m3* B, int n0, int k0, int N, int K, int tid)
+{
+  constexpr int ITERS = (BN_WSP * BK_WSP) / (THREADS * 16);
+  static_assert((BN_WSP * BK_WSP) % (THREADS * 16) == 0, "B load not tileable");
+  #pragma unroll
+  for (int it = 0; it < ITERS; it++) {
+    int id = tid + it * THREADS;
+    int r  = id / (BK_WSP / 16);
+    int c  = (id % (BK_WSP / 16)) * 16;
+    bool ok = (n0 + r) < N;
+    const void* gptr = &B[(size_t)(n0 + r) * K + (k0 + c)];
+    cp_async_16(&sB[r][c], gptr, ok);
+  }
+}
+
+template <int THREADS>
+__device__ __forceinline__ void stage_load_B_tc(
+    __nv_fp8_e4m3 (*sB)[LDB_TC_PAD],
     const __nv_fp8_e4m3* B, int n0, int k0, int N, int K, int tid)
 {
   constexpr int ITERS = (BN_WSP * BK_WSP) / (THREADS * 16);
@@ -1675,6 +1778,164 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
     }
   }
 }
+
+#if defined(ENABLE_MOE_TCGEN05)
+__global__ __launch_bounds__(THREADS_WSP, 1)
+void gemm_fp8_fp8_tcgen05_grouped_kernel(
+    const __nv_fp8_e4m3* __restrict__ A_base,     // [N_sel, K] fp8
+    const float*         __restrict__ A_scale,    // [N_sel, KB]
+    const __nv_fp8_e4m3* __restrict__ W_base,     // [E, N, K] fp8
+    const float*         __restrict__ S_base,     // [E, NB, KB]
+    const __grid_constant__ CUtensorMap A_tma,
+    const __grid_constant__ CUtensorMap W_tma,
+    const int32_t*       __restrict__ offs,
+    const int32_t*       __restrict__ sched_e,
+    const int32_t*       __restrict__ sched_tm,
+    int N, int K, int NB, int KB,
+    float*        __restrict__ C_base,            // [N_sel, ldC] fp32
+    int ldC)
+{
+  const int e    = sched_e[blockIdx.y];
+  const int tm   = sched_tm[blockIdx.y];
+  const int rs   = offs[e];
+  const int re   = offs[e + 1];
+  const int M    = re - rs;
+  const int m0   = tm * BM;
+  const int n0   = blockIdx.x * BN_WSP;
+  if (m0 + BM > M) return;
+
+  const float*         Asc     = A_scale  + (size_t)rs * (size_t)KB;
+  const __nv_fp8_e4m3* B_fp8   = W_base   + (size_t)e  * (size_t)N * (size_t)K;
+  const float*         B_scale = S_base   + (size_t)e  * (size_t)NB * (size_t)KB;
+  float*               C       = C_base   + (size_t)rs * (size_t)ldC;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int nb = n0 / BS;
+
+  extern __shared__ __align__(128) char smem_raw[];
+  char* smem_base = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 1023ULL) & ~1023ULL);
+  __nv_fp8_e4m3 (*sA)[BM][LDA_WSP_PAD] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BM][LDA_WSP_PAD]>(smem_base);
+  __nv_fp8_e4m3 (*sB)[BN_WSP][LDB_TC_PAD] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BN_WSP][LDB_TC_PAD]>(smem_base + SA_WSP_BYTES);
+
+  __shared__ __align__(8) uint64_t mbar_ready[STAGES_WSP];
+  __shared__ __align__(8) uint64_t mbar_tc;
+  __shared__ uint32_t tmem_addr;
+
+  if (tid < STAGES_WSP) mbarrier_init_shared(&mbar_ready[tid], 1);
+  if (tid == 0) mbarrier_init_shared(&mbar_tc, 1);
+  __syncthreads();
+  if (tid == 0) {
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("prefetch.tensormap [%0];\n"
+                 :: "l"(reinterpret_cast<uint64_t>(&A_tma)) : "memory");
+    asm volatile("prefetch.tensormap [%0];\n"
+                 :: "l"(reinterpret_cast<uint64_t>(&W_tma)) : "memory");
+  }
+  __syncthreads();
+
+  if (warp == 0) tcgen05_alloc_1sm(&tmem_addr, 128);
+  __syncthreads();
+
+  if (warp == 0 && lane == 0) {
+    constexpr uint32_t A_BYTES = BM * BK_WSP;
+    mbarrier_arrive_expect_tx_shared(&mbar_ready[0], A_BYTES);
+    cp_async_bulk_tensor_2d_shared_global(&sA[0][0][0],
+                                          &A_tma, 0, rs + m0,
+                                          &mbar_ready[0]);
+  }
+  stage_load_B_tc<THREADS_WSP>(sB[0], B_fp8, n0, 0, N, K, tid);
+  cp_async_commit();
+
+  constexpr int TC_COL_GROUPS_PER_THREAD = BN_WSP / 8;  // two warp groups cover 8 columns/step
+  float outer[TC_COL_GROUPS_PER_THREAD][4];
+  #pragma unroll
+  for (int i = 0; i < TC_COL_GROUPS_PER_THREAD; i++) {
+    outer[i][0] = 0.0f;
+    outer[i][1] = 0.0f;
+    outer[i][2] = 0.0f;
+    outer[i][3] = 0.0f;
+  }
+
+  const uint32_t idesc = make_tcgen05_f8_idesc_128x128(false, true);
+  const int row = ((warp & 3) << 5) + lane;
+  const int col_group_offset = (warp >= 4) ? 4 : 0;
+
+  for (int kb = 0; kb < KB; kb++) {
+    int stage = kb & 1;
+    uint32_t rphase = (kb >> 1) & 1;
+
+    int next_kb = kb + 1;
+    if (next_kb < KB) {
+      int next_stage = next_kb & 1;
+      int next_k_off = next_kb * BK_WSP;
+      if (warp == 0 && lane == 0) {
+        constexpr uint32_t A_BYTES = BM * BK_WSP;
+        mbarrier_arrive_expect_tx_shared(&mbar_ready[next_stage], A_BYTES);
+        cp_async_bulk_tensor_2d_shared_global(&sA[next_stage][0][0],
+                                              &A_tma, next_k_off, rs + m0,
+                                              &mbar_ready[next_stage]);
+      }
+      stage_load_B_tc<THREADS_WSP>(sB[next_stage], B_fp8, n0, next_k_off, N, K, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
+    __syncthreads();
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+
+    if (tid == 0) {
+      #pragma unroll
+      for (int kk = 0; kk < BK_WSP; kk += 32) {
+        uint64_t desc_a = make_tcgen05_smem_desc(&sA[stage][0][kk], LDA_WSP_PAD, 0);
+        uint64_t desc_b = make_tcgen05_smem_desc(&sB[stage][0][kk], LDB_TC_PAD, 0);
+        tcgen05_mma_f8f6f4_128x128(tmem_addr, desc_a, desc_b, idesc, kk != 0);
+      }
+      tcgen05_commit_mbarrier(&mbar_tc);
+    }
+    mbarrier_wait_parity_shared(&mbar_tc, kb & 1);
+    __syncthreads();
+
+    float w_sc = B_scale[(size_t)nb * KB + kb];
+    float s = Asc[(size_t)(m0 + row) * KB + kb] * w_sc;
+    #pragma unroll
+    for (int i = 0; i < TC_COL_GROUPS_PER_THREAD; i++) {
+      int col = i * 8 + col_group_offset;
+      float r0, r1, r2, r3;
+      uint32_t taddr = tmem_addr + (static_cast<uint32_t>(row & 96) << 16) + col;
+      tcgen05_ld_x4_f32(taddr, r0, r1, r2, r3);
+      outer[i][0] += r0 * s;
+      outer[i][1] += r1 * s;
+      outer[i][2] += r2 * s;
+      outer[i][3] += r3 * s;
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int i = 0; i < TC_COL_GROUPS_PER_THREAD; i++) {
+    int col = i * 8 + col_group_offset;
+    #pragma unroll
+    for (int q = 0; q < 4; q++) {
+      if (n0 + col + q < N) {
+        C[(size_t)(m0 + row) * ldC + (n0 + col + q)] = outer[i][q];
+      }
+    }
+  }
+  __syncthreads();
+  if (warp == 0) {
+    tcgen05_dealloc_1sm(tmem_addr, 128);
+    tcgen05_relinquish_1sm();
+  }
+}
+#endif
 
 // Vectorized gather: one warp per row handles 32×16 = 512 fp8 bytes per step;
 // grid covers H = NH_BLKS*BS = 7168 with ceil(7168/512) = 14 waves per warp.
@@ -1962,6 +2223,11 @@ static void run_impl(
     cudaFuncSetAttribute(gemm_fp8_fp8_wsp_grouped_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)GEMM_WSP_SMEM_BYTES);
+#if defined(ENABLE_MOE_TCGEN05)
+    cudaFuncSetAttribute(gemm_fp8_fp8_tcgen05_grouped_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)GEMM_TC_SMEM_BYTES);
+#endif
     gemm_shmem_attr_set = true;
   }
 
@@ -2054,7 +2320,11 @@ static void run_impl(
     int fast_m_tiles = use_wsp_gemm1 ? total_full_m_tiles : 0;
     if (fast_m_tiles > 0) {
       dim3 grid((II + BN_WSP - 1) / BN_WSP, fast_m_tiles);
+#if defined(ENABLE_MOE_TCGEN05)
+      gemm_fp8_fp8_tcgen05_grouped_kernel<<<grid, THREADS_WSP, GEMM_TC_SMEM_BYTES, stream>>>(
+#else
       gemm_fp8_fp8_wsp_grouped_kernel<<<grid, THREADS_WSP, GEMM_WSP_SMEM_BYTES, stream>>>(
+#endif
           g_ws.d_A_fp8, g_ws.d_A_scale,
           p_w13_fp8, p_w13_sc,
           A_tma, W_tma,
