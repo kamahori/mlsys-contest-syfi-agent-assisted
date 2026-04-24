@@ -115,6 +115,7 @@ void attn_split_kernel(
   int32_t*       sIdx = reinterpret_cast<int32_t*>(sP + H * BLOCK_N_PAD);
   float*         sM   = reinterpret_cast<float*>(sIdx + BLOCK_N);
   float*         sLn  = sM + H;
+  int*           sAny = reinterpret_cast<int*>(sLn + H);
 
   const int k_base = split * BLOCK_N;
 
@@ -141,7 +142,24 @@ void attn_split_kernel(
   for (int i = tid; i < BLOCK_N; i += THREADS) {
     sIdx[i] = sparse_idx[t * K_MAX + k_base + i];
   }
+  if (tid == 0) *sAny = 0;
   __syncthreads();
+
+  // Many contest sparse rows are mostly padding. Empty split chunks cannot
+  // affect the global softmax merge, so skip all K gather/QK/PV work for them.
+  #pragma unroll
+  for (int i = tid; i < BLOCK_N; i += THREADS) {
+    if (sIdx[i] != -1) atomicExch(sAny, 1);
+  }
+  __syncthreads();
+  if (*sAny == 0) {
+    if (tid < H) {
+      size_t off = ((size_t)t * K_SPLITS + split) * H + tid;
+      partial_m[off] = NEG_INF;
+      partial_l[off] = 0.0f;
+    }
+    return;
+  }
 
   // ---- Gather K via cp.async (16B lane-wise) ----
   {
