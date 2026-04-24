@@ -531,9 +531,9 @@ static void run_impl(
   auto* lse_out = static_cast<float*>(lse.data_ptr());
 
   if (chosen_splits == 64) {
-    dispatch_once<64, 32, 4, 0>(Nt, grid_split, stream, qn, qp, ckv, kpe, si, sm_scale, out, lse_out);
+    dispatch_once<64, 32, 2, 0>(Nt, grid_split, stream, qn, qp, ckv, kpe, si, sm_scale, out, lse_out);
   } else {
-    dispatch_once<32, 64, 4, 1>(Nt, grid_split, stream, qn, qp, ckv, kpe, si, sm_scale, out, lse_out);
+    dispatch_once<32, 64, 2, 1>(Nt, grid_split, stream, qn, qp, ckv, kpe, si, sm_scale, out, lse_out);
   }
 }
 
