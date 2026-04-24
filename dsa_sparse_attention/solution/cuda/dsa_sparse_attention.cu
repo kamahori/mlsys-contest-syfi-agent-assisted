@@ -119,6 +119,27 @@ void attn_split_kernel(
 
   const int k_base = split * BLOCK_N;
 
+  // Valid sparse entries are prefix-packed and padded with a -1 tail. A split
+  // is empty iff its first entry is -1, so empty chunks can return before
+  // loading Q or the rest of the split indices.
+  if (tid == 0) *sAny = (sparse_idx[t * K_MAX + k_base] != -1);
+  __syncthreads();
+  if (*sAny == 0) {
+    if (tid < H) {
+      size_t off = ((size_t)t * K_SPLITS + split) * H + tid;
+      partial_m[off] = NEG_INF;
+      partial_l[off] = 0.0f;
+    }
+    return;
+  }
+
+  // ---- Load sparse indices into smem ----
+  #pragma unroll
+  for (int i = tid; i < BLOCK_N; i += THREADS) {
+    sIdx[i] = sparse_idx[t * K_MAX + k_base + i];
+  }
+  __syncthreads();
+
   // ---- Load Q (nope ‖ pe) to sQ [H, D_TOT_PAD] (padding bytes are unused) ----
   {
     const float4* src_n = reinterpret_cast<const float4*>(q_nope + t * H * DC);
@@ -135,30 +156,6 @@ void attn_split_kernel(
       int d_f = i % (DP / 8);
       reinterpret_cast<float4*>(sQ + h * D_TOT_PAD + DC)[d_f] = src_p[i];
     }
-  }
-
-  // ---- Load sparse indices into smem ----
-  #pragma unroll
-  for (int i = tid; i < BLOCK_N; i += THREADS) {
-    sIdx[i] = sparse_idx[t * K_MAX + k_base + i];
-  }
-  if (tid == 0) *sAny = 0;
-  __syncthreads();
-
-  // Many contest sparse rows are mostly padding. Empty split chunks cannot
-  // affect the global softmax merge, so skip all K gather/QK/PV work for them.
-  #pragma unroll
-  for (int i = tid; i < BLOCK_N; i += THREADS) {
-    if (sIdx[i] != -1) atomicExch(sAny, 1);
-  }
-  __syncthreads();
-  if (*sAny == 0) {
-    if (tid < H) {
-      size_t off = ((size_t)t * K_SPLITS + split) * H + tid;
-      partial_m[off] = NEG_INF;
-      partial_l[off] = 0.0f;
-    }
-    return;
   }
 
   // ---- Gather K via cp.async (16B lane-wise) ----
