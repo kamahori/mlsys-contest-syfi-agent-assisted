@@ -62,8 +62,10 @@ __global__ void route_kernel(
     const __nv_bfloat16* __restrict__ bias,    // [E_GLOBAL]
     float scaling_factor,
     int T,
+    int local_expert_offset,
     int32_t* __restrict__ topk_idx_out,        // [T, TOP_K]
-    float*   __restrict__ topk_w_out)          // [T, TOP_K]
+    float*   __restrict__ topk_w_out,          // [T, TOP_K]
+    int32_t* __restrict__ counts)              // [E_LOCAL]
 {
   const int t = blockIdx.x;
   if (t >= T) return;
@@ -175,6 +177,10 @@ __global__ void route_kernel(
     for (int k = 0; k < TOP_K; k++) {
       topk_idx_out[(size_t)t * TOP_K + k] = tk_idx[k];
       topk_w_out  [(size_t)t * TOP_K + k] = tk_sig[k] * inv * scaling_factor;
+      int le = tk_idx[k] - local_expert_offset;
+      if ((unsigned)le < (unsigned)E_LOCAL) {
+        atomicAdd(&counts[le], 1);
+      }
     }
   }
 }
@@ -379,6 +385,37 @@ __device__ __forceinline__ void stage_load_A(
     bool ok = (m0 + r) < M;
     const void* gptr = &A[(size_t)(m0 + r) * K + (k0 + c)];
     cp_async_16(&sA[r][c], gptr, ok);
+  }
+}
+
+__device__ __forceinline__ void stage_make_swiglu_A(
+    __nv_bfloat16 (*sA)[LDA_S],
+    const float* G1, int m0,
+    int k0, int M, int tid)
+{
+  constexpr int A_ITERS = (BM * BK) / (THREADS_GEMM * 8);
+  #pragma unroll
+  for (int it = 0; it < A_ITERS; it++) {
+    int id = tid + it * THREADS_GEMM;
+    int r  = id / (BK / 8);
+    int c  = (id % (BK / 8)) * 8;
+    int gm = m0 + r;
+    int gk = k0 + c;
+    __nv_bfloat16 dst[8];
+    if (gm < M) {
+      const float* row = G1 + (size_t)gm * II;
+      #pragma unroll
+      for (int i = 0; i < 8; i++) {
+        float x1 = row[gk + i];
+        float x2 = row[I + gk + i];
+        float silu = x2 / (1.0f + __expf(-x2));
+        dst[i] = __float2bfloat16(silu * x1);
+      }
+    } else {
+      #pragma unroll
+      for (int i = 0; i < 8; i++) dst[i] = __float2bfloat16(0.0f);
+    }
+    *reinterpret_cast<uint4*>(&sA[r][c]) = *reinterpret_cast<const uint4*>(dst);
   }
 }
 
@@ -879,6 +916,128 @@ __global__ void gemm_bf16_fp8w_fused_acc_grouped_kernel(
   }
 
   // Fused epilogue: write fp32 × per-row weight atomically to acc_out[token, col].
+  const int lane = tid & 31;
+  __syncthreads();
+  float (*sW)[16][16] = reinterpret_cast<float (*)[16][16]>(smem_raw);
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M; i++)
+    #pragma unroll
+    for (int j = 0; j < W_TILES_N; j++) {
+      wmma::store_matrix_sync(&sW[warp][0][0], fC[i][j], 16, wmma::mem_row_major);
+      __syncwarp();
+      #pragma unroll
+      for (int ee = lane; ee < 256; ee += 32) {
+        int r = ee >> 4;
+        int c = ee & 15;
+        int gm = m0 + warp_m * WM + i * 16 + r;
+        int gn = n0 + warp_n * WN + j * 16 + c;
+        if (gm < M && gn < N) {
+          int t = Ptok[gm];
+          float w = Pwgt[gm];
+          float v = sW[warp][r][c] * w;
+          atomicAdd(&acc_out[(size_t)t * ldAcc + gn], v);
+        }
+      }
+      __syncwarp();
+	    }
+}
+
+// GEMM2 fused with SwiGLU input staging:
+//   A tile is computed from fp32 G1 as bf16(silu(gate) * up) directly in smem,
+//   then multiplied by fp8 W2 and scattered to the final fp32 accumulator.
+__global__ void gemm_swiglu_fp8w_fused_acc_grouped_kernel(
+    const float*        __restrict__ G1_base,     // [N_sel, 2I]
+    const __nv_fp8_e4m3* __restrict__ W_base,
+    const float*         __restrict__ S_base,
+    const int32_t*       __restrict__ offs,
+    const int32_t*       __restrict__ sched_e,
+    const int32_t*       __restrict__ sched_tm,
+    const int32_t*       __restrict__ perm_token,
+    const float*         __restrict__ perm_weight,
+    int N, int K, int NB, int KB,
+    float* __restrict__ acc_out,
+    int ldAcc)
+{
+  const int e    = sched_e[blockIdx.y];
+  const int tm   = sched_tm[blockIdx.y];
+  const int rs   = offs[e];
+  const int re   = offs[e + 1];
+  const int M    = re - rs;
+  const int m0   = tm * BM;
+  const int n0   = blockIdx.x * BN;
+  if (m0 >= M) return;
+
+  const float*         G1      = G1_base + (size_t)rs * II;
+  const __nv_fp8_e4m3* B_fp8   = W_base + (size_t)e * (size_t)N * (size_t)K;
+  const float*         B_scale = S_base + (size_t)e * (size_t)NB * (size_t)KB;
+  const int32_t*       Ptok    = perm_token + rs;
+  const float*         Pwgt    = perm_weight + rs;
+
+  const int tid    = threadIdx.x;
+  const int warp   = tid >> 5;
+  const int warp_m = warp / NWARPS_N;
+  const int warp_n = warp % NWARPS_N;
+  const int nb     = n0 / BS;
+
+  extern __shared__ __align__(16) char smem_raw[];
+  __nv_bfloat16 (*sA)[BM][LDA_S] =
+      reinterpret_cast<__nv_bfloat16 (*)[BM][LDA_S]>(smem_raw);
+  __nv_fp8_e4m3 (*sB_fp8)[BN][LDB_FP8] =
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BN][LDB_FP8]>(smem_raw + SA_BYTES_V2);
+  __nv_bfloat16 (*sB)[LDB_S] =
+      reinterpret_cast<__nv_bfloat16 (*)[LDB_S]>(
+          smem_raw + SA_BYTES_V2 + SBFP8_BYTES);
+
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major>    fA[W_TILES_M];
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major>    fB[W_TILES_N];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float>                          fC[W_TILES_M][W_TILES_N];
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M; i++)
+    #pragma unroll
+    for (int j = 0; j < W_TILES_N; j++)
+      wmma::fill_fragment(fC[i][j], 0.0f);
+
+  stage_make_swiglu_A(sA[0], G1, m0, 0, M, tid);
+  stage_load_B_fp8_async(sB_fp8[0], B_fp8, n0, 0, N, K, tid);
+  cp_async_commit();
+
+  int stage = 0;
+  for (int k = 0; k < K; k += BK) {
+    int next_k = k + BK;
+    if (next_k < K) {
+      int next_stage = 1 - stage;
+      stage_make_swiglu_A(sA[next_stage], G1, m0, next_k, M, tid);
+      stage_load_B_fp8_async(sB_fp8[next_stage], B_fp8, n0, next_k, N, K, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    int kb = k / BS;
+    float sc = B_scale[(size_t)nb * KB + kb];
+    convert_sB_fp8_to_bf16(sB_fp8[stage], sB, sc, tid);
+    __syncthreads();
+
+    #pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M; i++)
+        wmma::load_matrix_sync(fA[i], &sA[stage][warp_m * WM + i * 16][kk], LDA_S);
+      #pragma unroll
+      for (int j = 0; j < W_TILES_N; j++)
+        wmma::load_matrix_sync(fB[j], &sB[warp_n * WN + j * 16][kk], LDB_S);
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M; i++)
+        #pragma unroll
+        for (int j = 0; j < W_TILES_N; j++)
+          wmma::mma_sync(fC[i][j], fA[i], fB[j], fC[i][j]);
+    }
+
+    stage = 1 - stage;
+  }
+
   const int lane = tid & 31;
   __syncthreads();
   float (*sW)[16][16] = reinterpret_cast<float (*)[16][16]>(smem_raw);
@@ -1816,17 +1975,13 @@ static void run_impl(
   const float*         p_w2_sc   = static_cast<const float*>(gemm2_weights_scale.data_ptr());
   __nv_bfloat16*       p_out     = static_cast<__nv_bfloat16*>(output.data_ptr());
 
-  // 1. routing
-  route_kernel<<<T, E_GLOBAL, 0, stream>>>(
-      p_logits, p_bias, sf, T, g_ws.d_topk_idx, g_ws.d_topk_w);
-
-  // 2. counts / scan / fill
+  // 1. routing + local expert counts
   cudaMemsetAsync(g_ws.d_counts, 0, E_LOCAL * sizeof(int32_t), stream);
-  {
-    int th = 256;
-    perm_count_kernel<<<(T + th - 1) / th, th, 0, stream>>>(
-        g_ws.d_topk_idx, T, leo, g_ws.d_counts);
-  }
+  route_kernel<<<T, E_GLOBAL, 0, stream>>>(
+      p_logits, p_bias, sf, T, leo,
+      g_ws.d_topk_idx, g_ws.d_topk_w, g_ws.d_counts);
+
+  // 2. scan / fill
   scan_offsets_kernel<<<1, 1, 0, stream>>>(
       g_ws.d_counts, g_ws.d_offs, g_ws.d_write_ptr, g_ws.d_n_sel);
   {
@@ -1917,14 +2072,13 @@ static void run_impl(
           II, H, NII_BLKS, NH_BLKS,
           g_ws.d_G1, II);
     }
-    // 8b. SwiGLU over all N_sel rows (fp32 G1 → bf16 C), 4 elems/thread.
+    // 8b. SwiGLU over all N_sel rows.
     {
-      const int I4 = I / 4;  // I=2048 divisible by 4
       int th = 128;
-      dim3 grid((I4 + th - 1) / th, N_sel);
+      dim3 grid((I / 4 + th - 1) / th, N_sel);
       swiglu_kernel<<<grid, th, 0, stream>>>(g_ws.d_G1, N_sel, g_ws.d_C_bf);
     }
-    // 8c. Grouped GEMM2 + fused per-token weighted scatter (skips bf16 O intermediate).
+    // 8c. Grouped GEMM2 with per-token weighted scatter fused into epilogue.
     {
       dim3 grid((H + BN - 1) / BN, total_m_tiles);
       gemm_bf16_fp8w_fused_acc_grouped_kernel<<<grid, THREADS_GEMM, GEMM_SMEM_BYTES_GRP, stream>>>(
