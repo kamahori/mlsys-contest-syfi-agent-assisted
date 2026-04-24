@@ -476,6 +476,7 @@ static int smem_bytes_for() {
     + BLOCK_N_ * (int)sizeof(int32_t)                   // sIdx
     + H * (int)sizeof(float)                            // sM
     + H * (int)sizeof(float)                            // sLn
+    + (int)sizeof(int)                                  // sAny
     + 32;                                               // padding
 }
 
