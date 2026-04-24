@@ -20,8 +20,10 @@
  */
 
 #include <cuda_bf16.h>
+#include <cuda.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <cudaTypedefs.h>
 #include <mma.h>
 #include <math.h>
 #include <math_constants.h>
@@ -970,15 +972,21 @@ __device__ __forceinline__ void mbarrier_init_shared(uint64_t* bar, uint32_t cou
 __device__ __forceinline__ void mbarrier_arrive_shared(uint64_t* bar) {
   unsigned addr = __cvta_generic_to_shared(bar);
   uint64_t state;
-  asm volatile("mbarrier.arrive.shared.b64 %0, [%1];"
+  asm volatile("mbarrier.arrive.shared::cta.b64 %0, [%1];"
                : "=l"(state) : "r"(addr));
+}
+
+__device__ __forceinline__ void mbarrier_arrive_expect_tx_shared(uint64_t* bar, uint32_t tx_count) {
+  unsigned addr = __cvta_generic_to_shared(bar);
+  asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;"
+               :: "r"(addr), "r"(tx_count));
 }
 
 __device__ __forceinline__ void mbarrier_wait_parity_shared(uint64_t* bar, uint32_t phase) {
   unsigned addr = __cvta_generic_to_shared(bar);
   asm volatile(
     "{ .reg .pred p; waitLoop:\n"
-    "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+    "  mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
     "  @!p bra waitLoop; }\n"
     :: "r"(addr), "r"(phase));
 }
@@ -990,6 +998,36 @@ __device__ __forceinline__ void mbarrier_wait_parity_shared(uint64_t* bar, uint3
 __device__ __forceinline__ void cp_async_mbarrier_arrive(uint64_t* bar) {
   unsigned addr = __cvta_generic_to_shared(bar);
   asm volatile("cp.async.mbarrier.arrive.b64 [%0];" :: "r"(addr));
+}
+
+__device__ __forceinline__ void cp_async_bulk_1d_shared_global(
+    void* sdst, const void* gsrc, uint32_t bytes, uint64_t* bar) {
+  unsigned sdstaddr = __cvta_generic_to_shared(sdst);
+  unsigned mbaraddr = __cvta_generic_to_shared(bar);
+  asm volatile(
+      "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
+      "[%0], [%1], %2, [%3];"
+      :: "r"(sdstaddr), "l"(gsrc), "r"(bytes), "r"(mbaraddr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_bulk_tensor_2d_shared_global(
+    void* sdst, const CUtensorMap* tmap, int c0, int c1, uint64_t* bar) {
+  unsigned sdstaddr = __cvta_generic_to_shared(sdst);
+  unsigned mbaraddr = __cvta_generic_to_shared(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.tile "
+      "[%0], [%1, {%2, %3}], [%4];"
+      :: "r"(sdstaddr), "l"(tmap), "r"(c0), "r"(c1), "r"(mbaraddr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_bulk_tensor_3d_shared_global(
+    void* sdst, const CUtensorMap* tmap, int c0, int c1, int c2, uint64_t* bar) {
+  unsigned sdstaddr = __cvta_generic_to_shared(sdst);
+  unsigned mbaraddr = __cvta_generic_to_shared(bar);
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.tile "
+      "[%0], [%1, {%2, %3, %4}], [%5];"
+      :: "r"(sdstaddr), "l"(tmap), "r"(c0), "r"(c1), "r"(c2), "r"(mbaraddr) : "memory");
 }
 
 template <int THREADS>
@@ -1230,28 +1268,27 @@ __global__ void gemm_fp8_fp8_grouped_kernel(
 // the Hopper+/Blackwell idiom. Kernel left in the file so a future
 // attempt can iterate on it.
 // ======================================================================
-constexpr int BN_WSP             = 64;       // smaller N tile for WSP path
+constexpr int BN_WSP             = 128;
 constexpr int BK_WSP             = BK_FP8;   // 128
-constexpr int LDA_WSP_PAD        = BK_WSP + 16;
-constexpr int LDB_WSP_PAD        = BK_WSP + 16;
-constexpr int STAGES_WSP         = 3;
+constexpr int LDA_WSP_PAD        = BK_WSP;
+constexpr int LDB_WSP_PAD        = BK_WSP;
+constexpr int STAGES_WSP         = 2;
 constexpr int NPROD_WARPS        = 4;
 constexpr int NCONS_WARPS        = 4;
 constexpr int NWARPS_WSP         = NPROD_WARPS + NCONS_WARPS;          // 8
 constexpr int THREADS_WSP        = NWARPS_WSP * 32;                     // 256
 constexpr int NPROD_THREADS      = NPROD_WARPS * 32;                    // 128
 constexpr int NCONS_THREADS      = NCONS_WARPS * 32;                    // 128
-constexpr int NWARPS_M_CONS      = 2;
+constexpr int NWARPS_M_CONS      = 4;
 constexpr int NWARPS_N_CONS      = 2;
-constexpr int WM_CONS            = BM / NWARPS_M_CONS;                  // 64
-constexpr int WN_CONS            = BN_WSP / NWARPS_N_CONS;              // 32
+constexpr int WM_CONS            = BM / NWARPS_M_CONS;                  // 32
+constexpr int WN_CONS            = BN_WSP / NWARPS_N_CONS;              // 64
 constexpr int W_TILES_M_CONS     = WM_CONS / 16;                        // 4
 constexpr int W_TILES_N_CONS     = WN_CONS / 8;                         // 4
 constexpr size_t SA_WSP_BYTES    = (size_t)STAGES_WSP * BM     * LDA_WSP_PAD;
 constexpr size_t SB_WSP_BYTES    = (size_t)STAGES_WSP * BN_WSP * LDB_WSP_PAD;
-constexpr size_t MBAR_WSP_BYTES  = 2 * STAGES_WSP * sizeof(uint64_t);
 constexpr size_t GEMM_WSP_SMEM_BYTES =
-    SA_WSP_BYTES + SB_WSP_BYTES + MBAR_WSP_BYTES + 128;  // slack
+    SA_WSP_BYTES + SB_WSP_BYTES + 128;  // dynamic base alignment slack
 
 template <int THREADS>
 __device__ __forceinline__ void stage_load_A_wsp(
@@ -1295,6 +1332,8 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
     const float*         __restrict__ A_scale,    // [N_sel, KB]
     const __nv_fp8_e4m3* __restrict__ W_base,     // [E, N, K] fp8
     const float*         __restrict__ S_base,     // [E, NB, KB]
+    const __grid_constant__ CUtensorMap A_tma,
+    const __grid_constant__ CUtensorMap W_tma,
     const int32_t*       __restrict__ offs,
     const int32_t*       __restrict__ sched_e,
     const int32_t*       __restrict__ sched_tm,
@@ -1311,9 +1350,7 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
   const int n0   = blockIdx.x * BN_WSP;
   if (m0 >= M) return;
 
-  const __nv_fp8_e4m3* A       = A_base   + (size_t)rs * (size_t)K;
   const float*         Asc     = A_scale  + (size_t)rs * (size_t)KB;
-  const __nv_fp8_e4m3* B_fp8   = W_base   + (size_t)e  * (size_t)N * (size_t)K;
   const float*         B_scale = S_base   + (size_t)e  * (size_t)NB * (size_t)KB;
   float*               C       = C_base   + (size_t)rs * (size_t)ldC;
 
@@ -1327,156 +1364,155 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
   // Shared memory layout:
   //   [0                 ..)      sA[STAGES][BM][LDA_WSP_PAD]
   //   [SA_BYTES          ..)      sB[STAGES][BN_WSP][LDB_WSP_PAD]
-  //   [SA+SB             ..)      mbar_ready[STAGES]
-  //   [SA+SB+24          ..)      mbar_consumed[STAGES]
-  extern __shared__ __align__(16) char smem_raw[];
+  extern __shared__ __align__(128) char smem_raw[];
+  char* smem_base = reinterpret_cast<char*>(
+      (reinterpret_cast<uintptr_t>(smem_raw) + 127ULL) & ~127ULL);
   __nv_fp8_e4m3 (*sA)[BM][LDA_WSP_PAD] =
-      reinterpret_cast<__nv_fp8_e4m3 (*)[BM][LDA_WSP_PAD]>(smem_raw);
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BM][LDA_WSP_PAD]>(smem_base);
   __nv_fp8_e4m3 (*sB)[BN_WSP][LDB_WSP_PAD] =
-      reinterpret_cast<__nv_fp8_e4m3 (*)[BN_WSP][LDB_WSP_PAD]>(smem_raw + SA_WSP_BYTES);
-  uint64_t* mbar_ready    =
-      reinterpret_cast<uint64_t*>(smem_raw + SA_WSP_BYTES + SB_WSP_BYTES);
-  uint64_t* mbar_consumed = mbar_ready + STAGES_WSP;
+      reinterpret_cast<__nv_fp8_e4m3 (*)[BN_WSP][LDB_WSP_PAD]>(smem_base + SA_WSP_BYTES);
+  __shared__ __align__(8) uint64_t mbar_ready[STAGES_WSP];
 
-  // Initialize mbarriers once, with arrive counts matching the number of
-  // arriving threads per cycle.
+  // Ready barriers track the combined A+B bulk-copy bytes for each stage.
   if (tid < STAGES_WSP) {
-    mbarrier_init_shared(&mbar_ready[tid],    NPROD_THREADS);
-    mbarrier_init_shared(&mbar_consumed[tid], NCONS_THREADS);
+    mbarrier_init_shared(&mbar_ready[tid],  1);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+    asm volatile("prefetch.tensormap [%0];\n"
+                 :: "l"(reinterpret_cast<uint64_t>(&A_tma)) : "memory");
+    asm volatile("prefetch.tensormap [%0];\n"
+                 :: "l"(reinterpret_cast<uint64_t>(&W_tma)) : "memory");
   }
   __syncthreads();
 
-  const bool is_producer = (warp < NPROD_WARPS);
+  if (warp == 0 && lane == 0) {
+    constexpr uint32_t A_BYTES = BM * BK_WSP;
+    constexpr uint32_t B_BYTES = BN_WSP * BK_WSP;
+    mbarrier_arrive_expect_tx_shared(&mbar_ready[0], A_BYTES + B_BYTES);
+    cp_async_bulk_tensor_2d_shared_global(&sA[0][0][0],
+                                          &A_tma, 0, rs + m0,
+                                          &mbar_ready[0]);
+    cp_async_bulk_tensor_2d_shared_global(&sB[0][0][0],
+                                          &W_tma, 0, e * N + n0,
+                                          &mbar_ready[0]);
+  }
 
-  if (is_producer) {
-    // Producer tid within the producer group (0..127).
-    int ptid = tid;  // warps 0..3 already map to 0..127
+  // All eight warps compute the original 4x2 warp tile after one elected
+  // lane issues the next TMA copy.
+  const int cons_warp = warp;
+  const int warp_m    = cons_warp / NWARPS_N_CONS;
+  const int warp_n    = cons_warp % NWARPS_N_CONS;
 
-    for (int kb = 0; kb < KB; kb++) {
-      int stage = kb % STAGES_WSP;
-      // On reuse, wait for consumer to finish with this stage.
-      if (kb >= STAGES_WSP) {
-        uint32_t cphase = ((kb / STAGES_WSP) - 1) & 1;
-        mbarrier_wait_parity_shared(&mbar_consumed[stage], cphase);
-      }
-
-      int k_off = kb * BK_WSP;
-      stage_load_A_wsp<NPROD_THREADS>(sA[stage], A, m0, k_off, M, K, ptid);
-      stage_load_B_wsp<NPROD_THREADS>(sB[stage], B_fp8, n0, k_off, N, K, ptid);
-      cp_async_commit();
-      // Attach mbarrier arrival to this cp.async group — producer moves
-      // on without blocking, so multiple stages can be in flight.
-      cp_async_mbarrier_arrive(&mbar_ready[stage]);
-    }
-  } else {
-    // Consumer warps 4..7 → cons_warp 0..3 → (warp_m, warp_n) ∈ 2×2.
-    const int cons_warp = warp - NPROD_WARPS;
-    const int warp_m    = cons_warp / NWARPS_N_CONS;
-    const int warp_n    = cons_warp % NWARPS_N_CONS;
-
-    float outer[W_TILES_M_CONS][W_TILES_N_CONS][4];
+  float outer[W_TILES_M_CONS][W_TILES_N_CONS][4];
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M_CONS; i++)
     #pragma unroll
-    for (int i = 0; i < W_TILES_M_CONS; i++)
+    for (int j = 0; j < W_TILES_N_CONS; j++)
       #pragma unroll
-      for (int j = 0; j < W_TILES_N_CONS; j++)
-        #pragma unroll
-        for (int q = 0; q < 4; q++) outer[i][j][q] = 0.0f;
+      for (int q = 0; q < 4; q++) outer[i][j][q] = 0.0f;
 
-    for (int kb = 0; kb < KB; kb++) {
-      int stage = kb % STAGES_WSP;
-      uint32_t rphase = (kb / STAGES_WSP) & 1;
-      mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
+  for (int kb = 0; kb < KB; kb++) {
+    int stage = kb & 1;
+    uint32_t rphase = (kb >> 1) & 1;
+    mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
 
-      // Per-kblock inner accumulator.
-      float inner[W_TILES_M_CONS][W_TILES_N_CONS][4];
-      #pragma unroll
-      for (int i = 0; i < W_TILES_M_CONS; i++)
-        #pragma unroll
-        for (int j = 0; j < W_TILES_N_CONS; j++)
-          #pragma unroll
-          for (int q = 0; q < 4; q++) inner[i][j][q] = 0.0f;
-
-      #pragma unroll
-      for (int kk = 0; kk < BK_WSP; kk += 32) {
-        uint32_t Aregs[W_TILES_M_CONS][4];
-        #pragma unroll
-        for (int i = 0; i < W_TILES_M_CONS; i++) {
-          int rbase = warp_m * WM_CONS + i * 16;
-          int row0  = rbase + group_id;
-          int row1  = rbase + group_id + 8;
-          int col0  = kk + tid_in_group * 4;
-          int col1  = col0 + 16;
-          Aregs[i][0] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col0]);
-          Aregs[i][1] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col0]);
-          Aregs[i][2] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col1]);
-          Aregs[i][3] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col1]);
-        }
-        uint32_t Bregs[W_TILES_N_CONS][2];
-        #pragma unroll
-        for (int j = 0; j < W_TILES_N_CONS; j++) {
-          int cbase = warp_n * WN_CONS + j * 8;
-          int col_n = cbase + group_id;
-          int rowk0 = kk + tid_in_group * 4;
-          int rowk1 = rowk0 + 16;
-          Bregs[j][0] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk0]);
-          Bregs[j][1] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk1]);
-        }
-        #pragma unroll
-        for (int i = 0; i < W_TILES_M_CONS; i++) {
-          #pragma unroll
-          for (int j = 0; j < W_TILES_N_CONS; j++) {
-            mma_m16n8k32_e4m3(
-                inner[i][j][0], inner[i][j][1], inner[i][j][2], inner[i][j][3],
-                Aregs[i][0], Aregs[i][1], Aregs[i][2], Aregs[i][3],
-                Bregs[j][0], Bregs[j][1]);
-          }
-        }
-      }
-
-      // Apply per-kblock scales and accumulate into outer.
-      float w_sc = B_scale[(size_t)nb * KB + kb];
-      #pragma unroll
-      for (int i = 0; i < W_TILES_M_CONS; i++) {
-        int rbase    = warp_m * WM_CONS + i * 16;
-        int rlo_glob = m0 + rbase + group_id;
-        int rhi_glob = rlo_glob + 8;
-        float a_lo = (rlo_glob < M) ? Asc[(size_t)rlo_glob * KB + kb] : 0.0f;
-        float a_hi = (rhi_glob < M) ? Asc[(size_t)rhi_glob * KB + kb] : 0.0f;
-        float s_lo = a_lo * w_sc;
-        float s_hi = a_hi * w_sc;
-        #pragma unroll
-        for (int j = 0; j < W_TILES_N_CONS; j++) {
-          outer[i][j][0] += inner[i][j][0] * s_lo;
-          outer[i][j][1] += inner[i][j][1] * s_lo;
-          outer[i][j][2] += inner[i][j][2] * s_hi;
-          outer[i][j][3] += inner[i][j][3] * s_hi;
-        }
-      }
-
-      // Signal this stage consumed (producer may reload it).
-      mbarrier_arrive_shared(&mbar_consumed[stage]);
+    int next_kb = kb + 1;
+    if (next_kb < KB && warp == 0 && lane == 0) {
+      int next_stage = next_kb & 1;
+      int next_k_off = next_kb * BK_WSP;
+      constexpr uint32_t A_BYTES = BM * BK_WSP;
+      constexpr uint32_t B_BYTES = BN_WSP * BK_WSP;
+      mbarrier_arrive_expect_tx_shared(&mbar_ready[next_stage], A_BYTES + B_BYTES);
+      cp_async_bulk_tensor_2d_shared_global(&sA[next_stage][0][0],
+                                            &A_tma, next_k_off, rs + m0,
+                                            &mbar_ready[next_stage]);
+      cp_async_bulk_tensor_2d_shared_global(&sB[next_stage][0][0],
+                                            &W_tma, next_k_off, e * N + n0,
+                                            &mbar_ready[next_stage]);
     }
 
-    // Epilogue: write outer fp32 to C.
+    float w_sc = B_scale[(size_t)nb * KB + kb];
+    float scale_lo[W_TILES_M_CONS];
+    float scale_hi[W_TILES_M_CONS];
     #pragma unroll
     for (int i = 0; i < W_TILES_M_CONS; i++) {
-      int rbase = m0 + warp_m * WM_CONS + i * 16;
-      int rlo   = rbase + group_id;
-      int rhi   = rlo + 8;
+      int rbase    = warp_m * WM_CONS + i * 16;
+      int rlo_glob = m0 + rbase + group_id;
+      int rhi_glob = rlo_glob + 8;
+      float a_lo = (rlo_glob < M) ? Asc[(size_t)rlo_glob * KB + kb] : 0.0f;
+      float a_hi = (rhi_glob < M) ? Asc[(size_t)rhi_glob * KB + kb] : 0.0f;
+      scale_lo[i] = a_lo * w_sc;
+      scale_hi[i] = a_hi * w_sc;
+    }
+
+    #pragma unroll
+    for (int kk = 0; kk < BK_WSP; kk += 32) {
+      uint32_t Aregs[W_TILES_M_CONS][4];
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_CONS; i++) {
+        int rbase = warp_m * WM_CONS + i * 16;
+        int row0  = rbase + group_id;
+        int row1  = rbase + group_id + 8;
+        int col0  = kk + tid_in_group * 4;
+        int col1  = col0 + 16;
+        Aregs[i][0] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col0]);
+        Aregs[i][1] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col0]);
+        Aregs[i][2] = *reinterpret_cast<const uint32_t*>(&sA[stage][row0][col1]);
+        Aregs[i][3] = *reinterpret_cast<const uint32_t*>(&sA[stage][row1][col1]);
+      }
+      uint32_t Bregs[W_TILES_N_CONS][2];
       #pragma unroll
       for (int j = 0; j < W_TILES_N_CONS; j++) {
-        int cbase = n0 + warp_n * WN_CONS + j * 8;
-        int clo   = cbase + tid_in_group * 2;
-        int chi   = clo + 1;
-        if (rlo < M && clo < N) C[(size_t)rlo * ldC + clo] = outer[i][j][0];
-        if (rlo < M && chi < N) C[(size_t)rlo * ldC + chi] = outer[i][j][1];
-        if (rhi < M && clo < N) C[(size_t)rhi * ldC + clo] = outer[i][j][2];
-        if (rhi < M && chi < N) C[(size_t)rhi * ldC + chi] = outer[i][j][3];
+        int cbase = warp_n * WN_CONS + j * 8;
+        int col_n = cbase + group_id;
+        int rowk0 = kk + tid_in_group * 4;
+        int rowk1 = rowk0 + 16;
+        Bregs[j][0] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk0]);
+        Bregs[j][1] = *reinterpret_cast<const uint32_t*>(&sB[stage][col_n][rowk1]);
       }
+      #pragma unroll
+      for (int i = 0; i < W_TILES_M_CONS; i++) {
+        #pragma unroll
+        for (int j = 0; j < W_TILES_N_CONS; j++) {
+          float acc0 = 0.0f;
+          float acc1 = 0.0f;
+          float acc2 = 0.0f;
+          float acc3 = 0.0f;
+          mma_m16n8k32_e4m3(
+              acc0, acc1, acc2, acc3,
+              Aregs[i][0], Aregs[i][1], Aregs[i][2], Aregs[i][3],
+              Bregs[j][0], Bregs[j][1]);
+          outer[i][j][0] += acc0 * scale_lo[i];
+          outer[i][j][1] += acc1 * scale_lo[i];
+          outer[i][j][2] += acc2 * scale_hi[i];
+          outer[i][j][3] += acc3 * scale_hi[i];
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  // Epilogue: write outer fp32 to C.
+  #pragma unroll
+  for (int i = 0; i < W_TILES_M_CONS; i++) {
+    int rbase = m0 + warp_m * WM_CONS + i * 16;
+    int rlo   = rbase + group_id;
+    int rhi   = rlo + 8;
+    #pragma unroll
+    for (int j = 0; j < W_TILES_N_CONS; j++) {
+      int cbase = n0 + warp_n * WN_CONS + j * 8;
+      int clo   = cbase + tid_in_group * 2;
+      int chi   = clo + 1;
+      if (rlo < M && clo < N) C[(size_t)rlo * ldC + clo] = outer[i][j][0];
+      if (rlo < M && chi < N) C[(size_t)rlo * ldC + chi] = outer[i][j][1];
+      if (rhi < M && clo < N) C[(size_t)rhi * ldC + clo] = outer[i][j][2];
+      if (rhi < M && chi < N) C[(size_t)rhi * ldC + chi] = outer[i][j][3];
     }
   }
 }
-
 
 // Vectorized gather: one warp per row handles 32×16 = 512 fp8 bytes per step;
 // grid covers H = NH_BLKS*BS = 7168 with ceil(7168/512) = 14 waves per warp.
@@ -1484,33 +1520,24 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
 // count ~14× for typical workloads.
 __global__ void gather_hs_fp8_kernel(
     const __nv_fp8_e4m3* __restrict__ hs_fp8,
+    const float*         __restrict__ hs_scale,
     const int32_t*       __restrict__ perm_token,
-    int N_sel,
-    __nv_fp8_e4m3* __restrict__ A_fp8)
+    int T, int N_sel,
+    __nv_fp8_e4m3* __restrict__ A_fp8,
+    float* __restrict__ A_scale)
 {
   const int r    = blockIdx.x;
   if (r >= N_sel) return;
   const int t    = perm_token[r];
   const int tid  = threadIdx.x;              // 0..127
+  if (blockIdx.y == 0 && tid < NH_BLKS) {
+    A_scale[(size_t)r * NH_BLKS + tid] = hs_scale[(size_t)tid * T + t];
+  }
   // Each thread moves 16 fp8 bytes per wave; grid.y tiles H in chunks.
   const int base = blockIdx.y * (blockDim.x * 16) + tid * 16;
   if (base >= H) return;
   *reinterpret_cast<uint4*>(&A_fp8[(size_t)r * H + base]) =
       *reinterpret_cast<const uint4*>(&hs_fp8[(size_t)t * H + base]);
-}
-
-// Gather per-row per-kblock scales: A_scale[r, kb] = hs_scale[kb, perm_token[r]]
-__global__ void gather_hs_scale_kernel(
-    const float*   __restrict__ hs_scale,    // [NH_BLKS, T]
-    const int32_t* __restrict__ perm_token,  // [N_sel]
-    int T, int N_sel,
-    float* __restrict__ A_scale)             // [N_sel, NH_BLKS]
-{
-  int r  = blockIdx.x;
-  int kb = threadIdx.x;
-  if (r >= N_sel || kb >= NH_BLKS) return;
-  int t = perm_token[r];
-  A_scale[(size_t)r * NH_BLKS + kb] = hs_scale[(size_t)kb * T + t];
 }
 
 // ======================================================================
@@ -1601,7 +1628,6 @@ struct Workspace {
   int32_t* d_n_sel       = nullptr;
   int32_t* d_perm_token  = nullptr;
   float*   d_perm_weight = nullptr;
-  int32_t* d_active_le   = nullptr;  // [E_LOCAL] active-expert local ids (pinned host + mirrored device)
   int32_t* d_sched_e     = nullptr;  // grouped-GEMM schedule: expert per M-tile
   int32_t* d_sched_tm    = nullptr;  // grouped-GEMM schedule: tile_m per M-tile
   int32_t* h_sched_e     = nullptr;  // pinned host staging
@@ -1626,7 +1652,6 @@ static void ensure_singletons() {
   cudaMalloc(&g_ws.d_offs,      (E_LOCAL + 1) * sizeof(int32_t));
   cudaMalloc(&g_ws.d_write_ptr, E_LOCAL       * sizeof(int32_t));
   cudaMalloc(&g_ws.d_n_sel,     1             * sizeof(int32_t));
-  cudaMalloc(&g_ws.d_active_le, E_LOCAL       * sizeof(int32_t));
   g_ws.singletons_ok = true;
 }
 
@@ -1670,6 +1695,58 @@ static void ensure_per_token(int T) {
   cudaMalloc(&g_ws.d_C_bf,        nsmax * I  * sizeof(__nv_bfloat16));
   cudaMalloc(&g_ws.d_out_f32,     (size_t)T * H * sizeof(float));
   g_ws.cap_T = T;
+}
+
+static PFN_cuTensorMapEncodeTiled_v12000 get_encode_tiled() {
+  static PFN_cuTensorMapEncodeTiled_v12000 fn = nullptr;
+  if (fn != nullptr) return fn;
+  void* ptr = nullptr;
+  cudaDriverEntryPointQueryResult status;
+  cudaError_t err = cudaGetDriverEntryPointByVersion(
+      "cuTensorMapEncodeTiled", &ptr, 12000, cudaEnableDefault, &status);
+  if (err == cudaSuccess && status == cudaDriverEntryPointSuccess) {
+    fn = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(ptr);
+  }
+  return fn;
+}
+
+static bool make_gemm1_tma_maps(
+    const __nv_fp8_e4m3* A_base, int n_sel,
+    const __nv_fp8_e4m3* W_base,
+    CUtensorMap* A_tma, CUtensorMap* W_tma) {
+  auto encode = get_encode_tiled();
+  if (encode == nullptr || n_sel < BM) return false;
+
+  const cuuint64_t a_dims[2] = {(cuuint64_t)H, (cuuint64_t)n_sel};
+  const cuuint64_t a_strides[1] = {(cuuint64_t)H * sizeof(__nv_fp8_e4m3)};
+  const cuuint32_t a_box[2] = {(cuuint32_t)BK_WSP, (cuuint32_t)BM};
+  const cuuint32_t a_elem_stride[2] = {1, 1};
+  CUresult ar = encode(
+      A_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+      const_cast<__nv_fp8_e4m3*>(A_base),
+      a_dims, a_strides, a_box, a_elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (ar != CUDA_SUCCESS) return false;
+
+  const cuuint64_t w_dims[2] = {
+      (cuuint64_t)H,
+      (cuuint64_t)E_LOCAL * (cuuint64_t)II};
+  const cuuint64_t w_strides[1] = {
+      (cuuint64_t)H * sizeof(__nv_fp8_e4m3)};
+  const cuuint32_t w_box[2] = {(cuuint32_t)BK_WSP, (cuuint32_t)BN_WSP};
+  const cuuint32_t w_elem_stride[2] = {1, 1};
+  CUresult wr = encode(
+      W_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+      const_cast<__nv_fp8_e4m3*>(W_base),
+      w_dims, w_strides, w_box, w_elem_stride,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return wr == CUDA_SUCCESS;
 }
 
 }  // namespace
@@ -1741,7 +1818,7 @@ static void run_impl(
       p_logits, p_bias, sf, T, g_ws.d_topk_idx, g_ws.d_topk_w);
 
   // 2. counts / scan / fill
-  zero_i32_kernel<<<1, E_LOCAL, 0, stream>>>(g_ws.d_counts, E_LOCAL);
+  cudaMemsetAsync(g_ws.d_counts, 0, E_LOCAL * sizeof(int32_t), stream);
   {
     int th = 256;
     perm_count_kernel<<<(T + th - 1) / th, th, 0, stream>>>(
@@ -1763,19 +1840,7 @@ static void run_impl(
   cudaStreamSynchronize(stream);
   const int N_sel = offs_host[E_LOCAL];
 
-  // 5. Build active-expert list on host, copy to device.
-  int32_t active_host[E_LOCAL];
-  int num_active = 0;
-  for (int e = 0; e < E_LOCAL; e++) {
-    if (offs_host[e + 1] > offs_host[e]) active_host[num_active++] = e;
-  }
-  if (num_active > 0) {
-    cudaMemcpyAsync(g_ws.d_active_le, active_host,
-                    num_active * sizeof(int32_t),
-                    cudaMemcpyHostToDevice, stream);
-  }
-
-  // 6. Gather permuted fp8 hidden states + per-row per-kblock scale (for FP8 MMA GEMM1).
+  // 5. Gather permuted fp8 hidden states + per-row per-kblock scale (for FP8 MMA GEMM1).
   if (N_sel > 0) {
     {
       // 128 threads × 16B = 2048 bytes/block; H=7168 → ceil(7168/2048)=4 tiles.
@@ -1784,23 +1849,35 @@ static void run_impl(
       constexpr int GATHER_TILES   = (H + GATHER_PER_BLK - 1) / GATHER_PER_BLK;
       dim3 grid(N_sel, GATHER_TILES);
       gather_hs_fp8_kernel<<<grid, GATHER_THREADS, 0, stream>>>(
-          p_hs_fp8, g_ws.d_perm_token, N_sel, g_ws.d_A_fp8);
+          p_hs_fp8, p_hs_sc, g_ws.d_perm_token, T, N_sel,
+          g_ws.d_A_fp8, g_ws.d_A_scale);
     }
-    gather_hs_scale_kernel<<<N_sel, NH_BLKS, 0, stream>>>(
-        p_hs_sc, g_ws.d_perm_token, T, N_sel, g_ws.d_A_scale);
   }
 
   // 7. zero fp32 accumulator (cudaMemsetAsync is ~6× faster than a naive 4B/thread kernel)
   cudaMemsetAsync(g_ws.d_out_f32, 0, (size_t)T * H * sizeof(float), stream);
 
-  // Build grouped-GEMM schedule on host: one entry per (expert, M-tile).
+  // Build grouped-GEMM schedules on host. Full 128-row tiles go first so
+  // GEMM1 can use the warp-specialized bulk-copy path; tail tiles remain on
+  // the proven non-WSP path for correct zero-fill boundary behavior.
   int total_m_tiles = 0;
+  int total_full_m_tiles = 0;
   for (int e = 0; e < E_LOCAL; e++) {
     int Tk = offs_host[e + 1] - offs_host[e];
-    int nmt = (Tk + BM - 1) / BM;
-    for (int m = 0; m < nmt; m++) {
+    int nmt_full = Tk / BM;
+    for (int m = 0; m < nmt_full; m++) {
       g_ws.h_sched_e[total_m_tiles]  = e;
       g_ws.h_sched_tm[total_m_tiles] = m;
+      total_m_tiles++;
+    }
+    total_full_m_tiles = total_m_tiles;
+  }
+  for (int e = 0; e < E_LOCAL; e++) {
+    int Tk = offs_host[e + 1] - offs_host[e];
+    int nmt_full = Tk / BM;
+    if (Tk > nmt_full * BM) {
+      g_ws.h_sched_e[total_m_tiles]  = e;
+      g_ws.h_sched_tm[total_m_tiles] = nmt_full;
       total_m_tiles++;
     }
   }
@@ -1810,15 +1887,30 @@ static void run_impl(
     cudaMemcpyAsync(g_ws.d_sched_tm, g_ws.h_sched_tm,
                     total_m_tiles * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
 
-    // 8a. Grouped GEMM1 — FP8×FP8 tensor cores, per-kblock block-scale accumulation.
-    // (Warp-specialized variant `gemm_fp8_fp8_wsp_grouped_kernel` exists in
-    // this file but is currently disabled — see comment at its definition.)
-    {
-      dim3 grid((II + BN - 1) / BN, total_m_tiles);
+    // 8a. Grouped GEMM1. Full tiles can use the tensor-map TMA WSP path;
+    // tail tiles use the original per-thread cp.async kernel.
+    CUtensorMap A_tma{};
+    CUtensorMap W_tma{};
+    bool use_wsp_gemm1 = (total_full_m_tiles > 0) &&
+        make_gemm1_tma_maps(g_ws.d_A_fp8, N_sel, p_w13_fp8, &A_tma, &W_tma);
+    int fast_m_tiles = use_wsp_gemm1 ? total_full_m_tiles : 0;
+    if (fast_m_tiles > 0) {
+      dim3 grid((II + BN_WSP - 1) / BN_WSP, fast_m_tiles);
+      gemm_fp8_fp8_wsp_grouped_kernel<<<grid, THREADS_WSP, GEMM_WSP_SMEM_BYTES, stream>>>(
+          g_ws.d_A_fp8, g_ws.d_A_scale,
+          p_w13_fp8, p_w13_sc,
+          A_tma, W_tma,
+          g_ws.d_offs, g_ws.d_sched_e, g_ws.d_sched_tm,
+          II, H, NII_BLKS, NH_BLKS,
+          g_ws.d_G1, II);
+    }
+    int total_tail_m_tiles = total_m_tiles - fast_m_tiles;
+    if (total_tail_m_tiles > 0) {
+      dim3 grid((II + BN - 1) / BN, total_tail_m_tiles);
       gemm_fp8_fp8_grouped_kernel<<<grid, THREADS_FP8, GEMM_FP8_SMEM_BYTES, stream>>>(
           g_ws.d_A_fp8, g_ws.d_A_scale,
           p_w13_fp8, p_w13_sc,
-          g_ws.d_offs, g_ws.d_sched_e, g_ws.d_sched_tm,
+          g_ws.d_offs, g_ws.d_sched_e + fast_m_tiles, g_ws.d_sched_tm + fast_m_tiles,
           II, H, NII_BLKS, NH_BLKS,
           g_ws.d_G1, II);
     }
