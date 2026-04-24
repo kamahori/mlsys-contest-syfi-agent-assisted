@@ -35,8 +35,6 @@ constexpr int Hv     = 8;
 constexpr int V_TILE = 16;
 constexpr int N_V    = V_DIM / V_TILE;              // 8
 constexpr int NT     = V_TILE / 16;                 // 1
-constexpr int WARPS  = 4;
-constexpr int BLOCK_THREADS = WARPS * 32;           // 128
 constexpr int C      = 16;
 // Pad shmem row strides to break the 128-stride bank conflict in ldmatrix.
 // Choose strides ±8 elements (16 bytes) from natural sizes so that 16 rows
@@ -59,7 +57,8 @@ static __forceinline__ __device__ void cp_async_wait_1() {
   asm volatile("cp.async.wait_group 1;\n");
 }
 
-__global__ __launch_bounds__(BLOCK_THREADS, 4)
+template<int WARPS_, int BLOCK_THREADS_, int STATE_TILES_>
+__global__ __launch_bounds__(BLOCK_THREADS_, (BLOCK_THREADS_ == 128 ? 2 : 1))
 void gdn_prefill_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ k_ptr,
@@ -113,12 +112,12 @@ void gdn_prefill_kernel(
     float* ns_bh = new_state + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
     if (state_ptr != nullptr) {
       const float* s_bh = state_ptr + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
-      for (int i = tid; i < V_TILE * K_DIM; i += BLOCK_THREADS) {
+      for (int i = tid; i < V_TILE * K_DIM; i += BLOCK_THREADS_) {
         int vt = i / K_DIM, k = i % K_DIM;
         ns_bh[(v_base + vt) * K_DIM + k] = s_bh[(v_base + vt) * K_DIM + k];
       }
     } else {
-      for (int i = tid; i < V_TILE * K_DIM; i += BLOCK_THREADS) {
+      for (int i = tid; i < V_TILE * K_DIM; i += BLOCK_THREADS_) {
         int vt = i / K_DIM, k = i % K_DIM;
         ns_bh[(v_base + vt) * K_DIM + k] = 0.f;
       }
@@ -132,7 +131,7 @@ void gdn_prefill_kernel(
     const float* s_bh = state_ptr + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
     // Distribute V_TILE rows across 4 warps (4 rows per warp)
     #pragma unroll
-    for (int vt = warp_id; vt < V_TILE; vt += WARPS) {
+    for (int vt = warp_id; vt < V_TILE; vt += WARPS_) {
       const float4* src4 =
           reinterpret_cast<const float4*>(s_bh + (v_base + vt) * K_DIM);
       float4 g = src4[lane];
@@ -144,7 +143,7 @@ void gdn_prefill_kernel(
     }
   } else {
     #pragma unroll
-    for (int vt = warp_id; vt < V_TILE; vt += WARPS) {
+    for (int vt = warp_id; vt < V_TILE; vt += WARPS_) {
       int k0 = lane * 4;
       S_fp[k0    ][vt] = 0.f;
       S_fp[k0 + 1][vt] = 0.f;
@@ -154,10 +153,13 @@ void gdn_prefill_kernel(
   }
 
   auto issue_chunk_load = [&](int buf, int chunk_start_l, int C_actual_l) {
+    const bool load_participant = (WARPS_ == 4) || (warp_id >= 6);
+    const int load_tid = (WARPS_ == 4) ? tid : ((warp_id - 6) * 32 + lane);
+    const int load_threads = (WARPS_ == 4) ? BLOCK_THREADS_ : 64;
     // Q, K: 256 float4 per matrix, all threads participate
-    {
+    if (load_participant) {
       constexpr int NVEC = (C * K_DIM) / 8;
-      for (int i = tid; i < NVEC; i += BLOCK_THREADS) {
+      for (int i = load_tid; i < NVEC; i += load_threads) {
         int elem = i * 8;
         int tok  = elem / K_DIM;
         int kk   = elem % K_DIM;
@@ -175,9 +177,9 @@ void gdn_prefill_kernel(
       }
     }
     // V slab
-    {
+    if (load_participant) {
       constexpr int NVEC = (C * V_TILE) / 8;
-      for (int i = tid; i < NVEC; i += BLOCK_THREADS) {
+      for (int i = load_tid; i < NVEC; i += load_threads) {
         int elem = i * 8;
         int tok  = elem / V_TILE;
         int vt   = elem % V_TILE;
@@ -194,20 +196,21 @@ void gdn_prefill_kernel(
   };
 
   // ----- Persistent state fragments (held in registers across chunks) --------
-  // Each warp owns 2 m-tiles: m_off = warp_id*32, warp_id*32+16.
+  // Each warp owns STATE_TILES_ m-tiles.  The 4-warp specialization keeps two
+  // tiles per warp; the 8-warp specialization keeps one tile per warp.
   // After state update we write fragment→S_bf directly (bf16), avoiding the
   // fp32 S_fp round-trip per chunk.
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_state[2];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_state[STATE_TILES_];
   __syncthreads();  // wait for S_fp init above to be visible
   #pragma unroll
-  for (int t_idx = 0; t_idx < 2; ++t_idx) {
-    int m_off = warp_id * 32 + t_idx * 16;
+  for (int t_idx = 0; t_idx < STATE_TILES_; ++t_idx) {
+    int m_off = warp_id * STATE_TILES_ * 16 + t_idx * 16;
     wmma::load_matrix_sync(c_state[t_idx], &S_fp[m_off][0], V_TILE, wmma::mem_row_major);
   }
   // Initial S_fp → S_bf conversion (subsequent chunks write S_bf from fragments).
   {
     constexpr int N_VEC = (K_DIM * V_TILE) / 4;
-    for (int i = tid; i < N_VEC; i += BLOCK_THREADS) {
+    for (int i = tid; i < N_VEC; i += BLOCK_THREADS_) {
       int elem = i * 4;
       int k  = elem / V_TILE;
       int vt = elem % V_TILE;
@@ -282,7 +285,7 @@ void gdn_prefill_kernel(
     // ṽ = v / γ  (no sync after — matmuls don't read V_smem)
     {
       constexpr int N_VEC = (C * V_TILE) / 2;
-      for (int i = tid; i < N_VEC; i += BLOCK_THREADS) {
+      for (int i = tid; i < N_VEC; i += BLOCK_THREADS_) {
         int elem = i * 2;
         int tok  = elem / V_TILE;
         int vt   = elem % V_TILE;
@@ -339,7 +342,7 @@ void gdn_prefill_kernel(
         wmma::mma_sync(c, aK, bK, c);
       }
       wmma::store_matrix_sync(&KK[0][0], c, C, wmma::mem_row_major);
-    } else /* warp_id == 3 */ {
+    } else if (warp_id == 3) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> aQ;
       wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bK;
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
@@ -397,7 +400,6 @@ void gdn_prefill_kernel(
         }
       }
     }
-    __syncthreads();
 
     // =======================================================================
     // Matmul 5: Attn = QKmb @ U_smem  [C, C] @ [C, V_TILE]  — warp 0 only
@@ -417,7 +419,7 @@ void gdn_prefill_kernel(
     // Output write — all threads (256 elements / 128 threads = 2 per thread).
     {
       constexpr int N_VEC = (C * V_TILE) / 2;
-      for (int i = tid; i < N_VEC; i += BLOCK_THREADS) {
+      for (int i = tid; i < N_VEC; i += BLOCK_THREADS_) {
         int elem = i * 2;
         int t    = elem / V_TILE;
         int vt   = elem % V_TILE;
@@ -433,7 +435,7 @@ void gdn_prefill_kernel(
       }
     }
 
-    // State update — 8 m-tiles, 2 per warp.  c_state is persistent across chunks
+    // State update — 8 m-tiles split across active warps.  c_state is persistent across chunks
     // (no accumulator load).  After mma+scale, convert fragment to bf16 and write
     // directly to S_bf for the next chunk's matmul — avoids the fp32 S_fp round-trip.
     //
@@ -445,13 +447,13 @@ void gdn_prefill_kernel(
     //   x[6],x[7] at (row=group+8, col=tip*2+8, tip*2+9)
     {
       const float gC = gamma_cum[C - 1];
-      const int m_base = warp_id * 32;
+      const int m_base = warp_id * STATE_TILES_ * 16;
       const int group = lane >> 2;
       const int tip   = lane & 3;
       const int v0 = tip * 2;
       const int v8 = tip * 2 + 8;
       #pragma unroll
-      for (int t_idx = 0; t_idx < 2; ++t_idx) {
+      for (int t_idx = 0; t_idx < STATE_TILES_; ++t_idx) {
         int m_off = m_base + t_idx * 16;
         wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> a;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> b;
@@ -483,14 +485,14 @@ void gdn_prefill_kernel(
   // then vectorized float4 global writes.
   // ===========================================================================
   #pragma unroll
-  for (int t_idx = 0; t_idx < 2; ++t_idx) {
-    int m_off = warp_id * 32 + t_idx * 16;
+  for (int t_idx = 0; t_idx < STATE_TILES_; ++t_idx) {
+    int m_off = warp_id * STATE_TILES_ * 16 + t_idx * 16;
     wmma::store_matrix_sync(&S_fp[m_off][0], c_state[t_idx], V_TILE, wmma::mem_row_major);
   }
   __syncthreads();
   float* ns_bh = new_state + (seq_idx * Hv + h_idx) * V_DIM * K_DIM;
   #pragma unroll
-  for (int vt = warp_id; vt < V_TILE; vt += WARPS) {
+  for (int vt = warp_id; vt < V_TILE; vt += WARPS_) {
     int k0 = lane * 4;
     float4 g;
     g.x = S_fp[k0    ][vt];
@@ -519,6 +521,7 @@ static void run_impl(
 {
   const int64_t N = cu_seqlens.shape()[0] - 1;
   float scale_f = (scale == 0.0) ? (1.0f / sqrtf((float)K_DIM)) : (float)scale;
+  const int64_t total_seq_len = q.shape()[0];
 
   const float* state_data =
       state.has_value()
@@ -526,21 +529,44 @@ static void run_impl(
           : nullptr;
 
   dim3 grid(N * Hv * N_V);
-  dim3 block(BLOCK_THREADS);
+  const bool use_8warp =
+      (N <= 2) ||
+      (N == 3 && (((total_seq_len >= 100) && (total_seq_len <= 160)) ||
+                  (total_seq_len >= 250))) ||
+      (N == 4 && total_seq_len >= 800) ||
+      (N == 5);
 
-  gdn_prefill_kernel<<<grid, block, 0, 0>>>(
-      static_cast<const __nv_bfloat16*>(q.data_ptr()),
-      static_cast<const __nv_bfloat16*>(k.data_ptr()),
-      static_cast<const __nv_bfloat16*>(v.data_ptr()),
-      state_data,
-      static_cast<const float*>(A_log.data_ptr()),
-      static_cast<const __nv_bfloat16*>(a.data_ptr()),
-      static_cast<const float*>(dt_bias.data_ptr()),
-      static_cast<const __nv_bfloat16*>(b.data_ptr()),
-      static_cast<const int64_t*>(cu_seqlens.data_ptr()),
-      static_cast<__nv_bfloat16*>(output.data_ptr()),
-      static_cast<float*>(new_state.data_ptr()),
-      scale_f);
+  if (use_8warp) {
+    dim3 block(256);
+    gdn_prefill_kernel<8, 256, 1><<<grid, block, 0, 0>>>(
+        static_cast<const __nv_bfloat16*>(q.data_ptr()),
+        static_cast<const __nv_bfloat16*>(k.data_ptr()),
+        static_cast<const __nv_bfloat16*>(v.data_ptr()),
+        state_data,
+        static_cast<const float*>(A_log.data_ptr()),
+        static_cast<const __nv_bfloat16*>(a.data_ptr()),
+        static_cast<const float*>(dt_bias.data_ptr()),
+        static_cast<const __nv_bfloat16*>(b.data_ptr()),
+        static_cast<const int64_t*>(cu_seqlens.data_ptr()),
+        static_cast<__nv_bfloat16*>(output.data_ptr()),
+        static_cast<float*>(new_state.data_ptr()),
+        scale_f);
+  } else {
+    dim3 block(128);
+    gdn_prefill_kernel<4, 128, 2><<<grid, block, 0, 0>>>(
+        static_cast<const __nv_bfloat16*>(q.data_ptr()),
+        static_cast<const __nv_bfloat16*>(k.data_ptr()),
+        static_cast<const __nv_bfloat16*>(v.data_ptr()),
+        state_data,
+        static_cast<const float*>(A_log.data_ptr()),
+        static_cast<const __nv_bfloat16*>(a.data_ptr()),
+        static_cast<const float*>(dt_bias.data_ptr()),
+        static_cast<const __nv_bfloat16*>(b.data_ptr()),
+        static_cast<const int64_t*>(cu_seqlens.data_ptr()),
+        static_cast<__nv_bfloat16*>(output.data_ptr()),
+        static_cast<float*>(new_state.data_ptr()),
+        scale_f);
+  }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_prefill, run_impl);
