@@ -1271,7 +1271,7 @@ __global__ void gemm_fp8_fp8_grouped_kernel(
 constexpr int BN_WSP             = 128;
 constexpr int BK_WSP             = BK_FP8;   // 128
 constexpr int LDA_WSP_PAD        = BK_WSP;
-constexpr int LDB_WSP_PAD        = BK_WSP;
+constexpr int LDB_WSP_PAD        = BK_WSP + 16;
 constexpr int STAGES_WSP         = 2;
 constexpr int NPROD_WARPS        = 4;
 constexpr int NCONS_WARPS        = 4;
@@ -1351,6 +1351,7 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
   if (m0 >= M) return;
 
   const float*         Asc     = A_scale  + (size_t)rs * (size_t)KB;
+  const __nv_fp8_e4m3* B_fp8   = W_base   + (size_t)e  * (size_t)N * (size_t)K;
   const float*         B_scale = S_base   + (size_t)e  * (size_t)NB * (size_t)KB;
   float*               C       = C_base   + (size_t)rs * (size_t)ldC;
 
@@ -1390,15 +1391,13 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
 
   if (warp == 0 && lane == 0) {
     constexpr uint32_t A_BYTES = BM * BK_WSP;
-    constexpr uint32_t B_BYTES = BN_WSP * BK_WSP;
-    mbarrier_arrive_expect_tx_shared(&mbar_ready[0], A_BYTES + B_BYTES);
+    mbarrier_arrive_expect_tx_shared(&mbar_ready[0], A_BYTES);
     cp_async_bulk_tensor_2d_shared_global(&sA[0][0][0],
                                           &A_tma, 0, rs + m0,
                                           &mbar_ready[0]);
-    cp_async_bulk_tensor_2d_shared_global(&sB[0][0][0],
-                                          &W_tma, 0, e * N + n0,
-                                          &mbar_ready[0]);
   }
+  stage_load_B_wsp<THREADS_WSP>(sB[0], B_fp8, n0, 0, N, K, tid);
+  cp_async_commit();
 
   // All eight warps compute the original 4x2 warp tile after one elected
   // lane issues the next TMA copy.
@@ -1417,22 +1416,26 @@ void gemm_fp8_fp8_wsp_grouped_kernel(
   for (int kb = 0; kb < KB; kb++) {
     int stage = kb & 1;
     uint32_t rphase = (kb >> 1) & 1;
-    mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
 
     int next_kb = kb + 1;
-    if (next_kb < KB && warp == 0 && lane == 0) {
+    if (next_kb < KB) {
       int next_stage = next_kb & 1;
       int next_k_off = next_kb * BK_WSP;
-      constexpr uint32_t A_BYTES = BM * BK_WSP;
-      constexpr uint32_t B_BYTES = BN_WSP * BK_WSP;
-      mbarrier_arrive_expect_tx_shared(&mbar_ready[next_stage], A_BYTES + B_BYTES);
-      cp_async_bulk_tensor_2d_shared_global(&sA[next_stage][0][0],
-                                            &A_tma, next_k_off, rs + m0,
-                                            &mbar_ready[next_stage]);
-      cp_async_bulk_tensor_2d_shared_global(&sB[next_stage][0][0],
-                                            &W_tma, next_k_off, e * N + n0,
-                                            &mbar_ready[next_stage]);
+      if (warp == 0 && lane == 0) {
+        constexpr uint32_t A_BYTES = BM * BK_WSP;
+        mbarrier_arrive_expect_tx_shared(&mbar_ready[next_stage], A_BYTES);
+        cp_async_bulk_tensor_2d_shared_global(&sA[next_stage][0][0],
+                                              &A_tma, next_k_off, rs + m0,
+                                              &mbar_ready[next_stage]);
+      }
+      stage_load_B_wsp<THREADS_WSP>(sB[next_stage], B_fp8, n0, next_k_off, N, K, tid);
+      cp_async_commit();
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
     }
+    mbarrier_wait_parity_shared(&mbar_ready[stage], rphase);
+    __syncthreads();
 
     float w_sc = B_scale[(size_t)nb * KB + kb];
     float scale_lo[W_TILES_M_CONS];
